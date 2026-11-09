@@ -1,0 +1,6 @@
+EmptyFolderNuker.exe
+version : 1.0.0
+built   : 2026-11-09T22:55Z
+source  : source files in this repository
+size    : 3746304 bytes
+sha256  : 6576cff4026dcc9bad86a4fd694f166ebaca97303ece2265691241c73f88ddb2

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Empty Folder Nuker</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app">
+  <header id="titlebar" data-tauri-drag-region>
+    <img class="tb-icon" src="img/icon.svg" alt="" draggable="false">
+    <span class="tb-name" data-tauri-drag-region>Empty Folder Nuker</span>
+    <span class="tb-spacer" data-tauri-drag-region></span>
+    <button class="tb-btn tb-menu" id="open-menu" aria-label="Menu" title="Menu"><svg viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" fill="none"/></svg></button>
+    <button class="tb-btn" id="win-min" aria-label="Minimize"><svg viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor"/></svg></button>
+    <button class="tb-btn tb-close" id="win-close" aria-label="Close"><svg viewBox="0 0 10 10"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor"/></svg></button>
+  </header>
+  <main id="main"></main>
+  <footer id="statusbar">
+    <span id="bridge" class="bridge" title="Backend connection"><i></i><span>Connecting…</span></span>
+    <span id="status-text"></span>
+    <span class="sb-fill"></span>
+  </footer>
+  <div id="drop-overlay" hidden><div>Drop a folder to scan it</div></div>
+  <div id="layer"></div>
+</div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

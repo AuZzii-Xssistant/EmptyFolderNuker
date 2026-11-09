@@ -1,0 +1,22 @@
+[package]
+name = "empty-folder-nuker"
+version = "1.0.0"
+edition = "2021"
+description = "Find and remove empty folders"
+
+[features]
+# Required for release builds made with plain `cargo build`: embeds the UI instead of
+# looking for a dev server.
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+efn-core = { path = "../core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.16"

@@ -1,0 +1,4 @@
+target/
+tests/node_modules
+tools/node_modules
+src-tauri/gen/
