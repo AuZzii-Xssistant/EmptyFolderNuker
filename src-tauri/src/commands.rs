@@ -306,10 +306,30 @@ pub fn fit_window(window: Window, anchor: State<'_, WindowAnchor>, width: f64, h
 pub fn open_bug_report() -> Result<(), String> {
     const URL: &str = "https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/new?template=bug_report.yml";
     #[cfg(windows)]
-    let opener = "explorer.exe";
-    #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let opener = "xdg-open";
-    Command::new(opener).arg(URL).spawn().map(|_| ()).map_err(|e| e.to_string())
+    {
+        use std::ffi::c_void;
+        use std::ptr::{null, null_mut};
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                window: *mut c_void, verb: *const u16, target: *const u16,
+                parameters: *const u16, directory: *const u16, show: i32,
+            ) -> *mut c_void;
+        }
+
+        let url: Vec<u16> = URL.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: url is NUL-terminated and remains alive for the call. Other pointers are optional.
+        // The HTTPS handler is the default browser. Explorer's file opener can ignore the URL.
+        let result = unsafe { ShellExecuteW(null_mut(), null(), url.as_ptr(), null(), null(), 1) };
+        if result as usize <= 32 {
+            return Err(format!("Could not open GitHub in your default browser (Windows error {}).", result as usize));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener).arg(URL).spawn().map(|_| ()).map_err(|e| e.to_string())
+    }
 }

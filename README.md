@@ -4,7 +4,7 @@ A portable Windows utility for finding and removing empty folders. It scans a fo
 
 ## Download
 
-Download [EmptyFolderNuker.exe](builds/EmptyFolderNuker.exe?raw=true) or open the [file on GitHub](builds/EmptyFolderNuker.exe). See [build information](builds/BUILDINFO.txt) for the version and SHA-256.
+Download [EmptyFolderNuker.exe](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/releases/latest/download/EmptyFolderNuker.exe) from the [latest GitHub release](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/releases/latest). The release notes give the version and SHA-256.
 
 The app runs on Windows 10 and 11 with Microsoft Edge WebView2 Runtime. Run the portable executable directly.
 
@@ -28,6 +28,8 @@ On launch, the app keeps a copy in `%LOCALAPPDATA%\EmptyFolderNuker` whether or 
 ## Build and test
 
 GitHub Actions tests and builds the Windows executable on pull requests and on pushes to `main`. You can also run **Windows build** manually from the **Actions** tab. Download the `EmptyFolderNuker-Windows-x64` artifact from a successful run for the executable and its checksum.
+
+To publish a GitHub Release, choose **Run workflow** on `main` and enable **Publish the verified Windows build as a GitHub Release**. The release uses the executable from that run and gets its own build tag. The app version stays the same, and existing releases stay available.
 
 The scanning and deletion logic lives in `core/`. The Windows app uses Tauri 2 with an embedded HTML, CSS, and JavaScript interface.
 
