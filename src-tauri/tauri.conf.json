@@ -12,18 +12,19 @@
       {
         "label": "main",
         "title": "Empty Folder Nuker",
-        "width": 432,
-        "height": 230,
+        "width": 452,
+        "height": 250,
         "minWidth": 300,
         "minHeight": 150,
         "decorations": false,
         "shadow": false,
+        "transparent": true,
         "visible": false,
         "resizable": false,
         "center": true,
         "dragDropEnabled": true,
         "maximizable": false,
-        "backgroundColor": "#11151d"
+        "backgroundColor": "#00000000"
       }
     ],
     "security": {

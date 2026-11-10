@@ -22,7 +22,6 @@
       calls.push([cmd, args]);
       switch (cmd) {
         case 'ping': return '1.0.0';
-        case 'set_background': return null;
         case 'fit_window': if (window.__failFits > 0) { window.__failFits--; throw 'window is minimized'; } if (window.__dropFits > 0) { window.__dropFits--; return null; } if (window.__resize) window.__resize(args.width, args.height); return null;
         case 'launch_folders': return [];
         case 'load_settings': return settings;

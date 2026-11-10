@@ -50,8 +50,9 @@ export function menu(items, x, y, minWidth) {
   }
   layer().append(m);
   const r = m.getBoundingClientRect();
-  m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 4)) + 'px';
-  m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 4)) + 'px';
+  const frame = document.getElementById('app').getBoundingClientRect();
+  m.style.left = Math.max(frame.left + 4, Math.min(x, frame.right - r.width - 4)) + 'px';
+  m.style.top = Math.max(frame.top + 4, Math.min(y, frame.bottom - r.height - 4)) + 'px';
   openMenu = m;
   return m;
 }

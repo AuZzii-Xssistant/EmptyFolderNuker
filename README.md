@@ -27,6 +27,8 @@ On launch, the app keeps a copy in `%LOCALAPPDATA%\EmptyFolderNuker` whether or 
 
 ## Build and test
 
+GitHub Actions tests and builds the Windows executable on pull requests and on pushes to `main`. You can also run **Windows build** manually from the **Actions** tab. Download the `EmptyFolderNuker-Windows-x64` artifact from a successful run for the executable and its checksum.
+
 The scanning and deletion logic lives in `core/`. The Windows app uses Tauri 2 with an embedded HTML, CSS, and JavaScript interface.
 
 On Windows, install the Rust MSVC toolchain, Microsoft C++ build tools, Windows SDK, Node.js, and Playwright with Chromium. Run the build script from PowerShell in this directory.
@@ -36,3 +38,7 @@ On Windows, install the Rust MSVC toolchain, Microsoft C++ build tools, Windows 
 ```
 
 If Playwright is installed outside the project, set `EFN_PLAYWRIGHT` to its module directory. Set `CHROMIUM` to use an existing Chromium or Edge executable. The script runs the Rust and browser suites, builds the portable executable, and writes it with its SHA-256 to `builds/`. On Linux, `bash build.sh` uses cargo-xwin to build the Windows executable.
+
+## Report a problem or suggest an improvement
+
+Use the bug icon in the title bar or open the [GitHub issue forms](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/new/choose). For a bug, include your Windows version, the app version from About, and steps to reproduce it. Remove private paths from anything you attach.

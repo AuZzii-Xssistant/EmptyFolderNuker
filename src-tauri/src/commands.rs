@@ -302,10 +302,14 @@ pub fn fit_window(window: Window, anchor: State<'_, WindowAnchor>, width: f64, h
     Ok(())
 }
 
-/* ---- window background (no white flash while the OS resizes) ---- */
-
-/// Match the native window background to the theme so growing the window never flashes white.
 #[tauri::command]
-pub fn set_background(window: Window, r: u8, g: u8, b: u8) -> Result<(), String> {
-    window.set_background_color(Some(tauri::window::Color(r, g, b, 255))).map_err(|e| e.to_string())
+pub fn open_bug_report() -> Result<(), String> {
+    const URL: &str = "https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/new?template=bug_report.yml";
+    #[cfg(windows)]
+    let opener = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let opener = "xdg-open";
+    Command::new(opener).arg(URL).spawn().map(|_| ()).map_err(|e| e.to_string())
 }

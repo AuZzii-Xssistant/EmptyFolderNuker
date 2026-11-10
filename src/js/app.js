@@ -24,11 +24,8 @@ let saveTimer;
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(() => call('store_settings', { json: JSON.stringify(S.cfg) }).catch(() => {}), 120); }
 async function flushSave() { clearTimeout(saveTimer); await call('store_settings', { json: JSON.stringify(S.cfg) }).catch(() => {}); }
 function set(k, v) { S.cfg[k] = v; save(); }
-// Native window background matches the theme, so growing the window never flashes white.
-const bgColor = () => (S.cfg.theme === 'light' ? [241, 243, 248] : [17, 21, 29]);
 const applyTheme = () => {
   document.documentElement.dataset.theme = S.cfg.theme;
-  if (hasBridge) { const [r, g, b] = bgColor(); call('set_background', { r, g, b }).catch(() => {}); }
   document.documentElement.dataset.density = S.cfg.compact ? 'compact' : 'comfortable';
   readRow();
 };
@@ -91,16 +88,31 @@ function contentHeight(width) {
   el.classList.remove('measure');
   return hgt;
 }
-const chrome = () => $('#titlebar').offsetHeight + $('#statusbar').offsetHeight;
-let revealTimer;
-function reveal(wait) { clearTimeout(revealTimer); revealTimer = setTimeout(() => main().classList.remove('swap'), wait); }
+const frame = () => 2 * (parseFloat(getComputedStyle(document.body).paddingLeft) + $('#app').clientLeft);
+const chrome = () => $('#titlebar').offsetHeight + $('#statusbar').offsetHeight + frame();
+const sizeMatches = ([w, hgt]) => Math.abs(innerWidth - w) <= 4 && Math.abs(innerHeight - hgt) <= 4;
+let finishReveal;
+function revealWhenSized(size) {
+  const el = main();
+  if (!el.classList.contains('resizing')) return;
+  if (!size || sizeMatches(size)) { el.classList.remove('resizing'); return; }
+  const onResize = () => { if (sizeMatches(size)) finish(); };
+  const finish = () => {
+    clearTimeout(timeout);
+    removeEventListener('resize', onResize);
+    finishReveal = null;
+    el.classList.remove('resizing');
+  };
+  const timeout = setTimeout(finish, 220);
+  finishReveal = finish;
+  addEventListener('resize', onResize);
+}
 // Ask the OS for a size, but only if it differs from the size we last asked for. (Comparing with the
 // live window size is wrong: right after a resize request the OS has not applied it yet.)
 function requestSize(w, hgt, show) {
   const last = S.lastReq;
   if (last && last[0] === w && last[1] === hgt) return false;
   const size = S.lastReq = [w, hgt];
-  if (!show) main().classList.add('swap'); // hide content while the OS resizes, then fade it in
   call('fit_window', { width: w, height: hgt, show }).catch(() => {
     if (S.lastReq === size) { S.lastReq = null; setTimeout(verifySize, 1000); }
   });
@@ -111,7 +123,7 @@ function requestSize(w, hgt, show) {
 function verifySize() {
   if (busy() || modalGrown || S.refits >= 3) return;
   const r = S.lastReq; // null: the last request failed or was refused
-  if (r && Math.abs(innerWidth - r[0]) <= 12 && Math.abs(innerHeight - r[1]) <= 12) return;
+  if (r && sizeMatches(r)) return;
   S.refits++; S.lastReq = null; scheduleFit();
 }
 addEventListener('focus', () => { S.refits = 0; setTimeout(verifySize, 400); }); // e.g. restored after being minimized
@@ -120,25 +132,22 @@ function fit(again = true, show = false) {
   // Scan and delete progress screens never resize the window: results stay results-sized, and the
   // home screen stays home-sized. Shrinking and regrowing for a one-second progress view is what
   // made the window end up the wrong size.
-  if (k === 'busy') { reveal(20); return; }
+  if (k === 'busy') { revealWhenSized(null); return; }
   let w, hgt;
   if (k === 'results' || k === 'page' || k === 'options') [w, hgt] = defaultSize(k);
   else {
-    w = Math.min(DEF[d].home, maxW);
-    hgt = contentHeight(w) + chrome() + 14;
+    w = Math.min(DEF[d].home + frame(), maxW);
+    hgt = contentHeight(w - frame()) + chrome() + 14;
   }
   w = Math.round(Math.min(w, maxW)); hgt = Math.round(Math.min(hgt, maxH));
-  if (show) {
-    clearTimeout(revealTimer);
-    main().classList.remove('swap');
-  }
+  if (show) main().classList.remove('resizing');
   const asked = requestSize(w, hgt, show);
-  if (!show) reveal(asked ? 150 : 20);
+  if (!show && !finishReveal) revealWhenSized(asked ? S.lastReq : null);
   if (asked) setTimeout(verifySize, 600);
   // Second pass once the OS has applied the size: if the content measured differently, refit.
   if (again && k === 'home') setTimeout(() => {
     if (kind() !== k) return;
-    const want = Math.round(Math.min(contentHeight(w) + chrome() + 14, maxH));
+    const want = Math.round(Math.min(contentHeight(w - frame()) + chrome() + 14, maxH));
     if (Math.abs(want - hgt) > 6) { S.lastReq = null; fit(false); }
   }, 280);
 }
@@ -149,7 +158,7 @@ let modalGrown = false;
 function adjustForModal() {
   const m = $('.modal');
   if (!m) { if (modalGrown) { modalGrown = false; scheduleFit(); } return; }
-  const need = Math.ceil(m.getBoundingClientRect().height) + 36;
+  const need = Math.ceil(m.getBoundingClientRect().height) + frame() + 36;
   if (need > innerHeight && need <= bounds().maxH) {
     modalGrown = true;
     const w = S.lastReq ? S.lastReq[0] : innerWidth;
@@ -162,14 +171,21 @@ new MutationObserver(() => { clearTimeout(modalT); modalT = setTimeout(adjustFor
 
 function go(view) { closeMenu(); if (view === 'home') S.outcome = null; S.view = view; render(); }
 let lastKey = '';
+let showScanProgress = false;
 const busy = () => S.scanning || S.deleting;
 function render() {
   const m = main();
+  m.inert = false;
   $('#open-menu').disabled = busy(); // menu, settings and pages make no sense while a scan or delete runs
   const key = kind() + S.view;
-  if (key !== lastKey) { S.refits = 0; m.classList.add('swap'); clearTimeout(revealTimer); revealTimer = setTimeout(() => m.classList.remove('swap'), 600); lastKey = key; } // watchdog
+  if (key !== lastKey) {
+    finishReveal?.();
+    S.refits = 0;
+    m.classList.add('resizing');
+    lastKey = key;
+  }
   m.replaceChildren();
-  const v = S.deleting ? viewDeleting : S.scanning ? viewScanning : { home: viewHome, options: viewOptions, results: viewResults, details: viewDetails, settings: viewSettings, about: viewAbout }[S.view];
+  const v = S.deleting ? viewDeleting : showScanProgress && S.scanning ? viewScanning : { home: viewHome, options: viewOptions, results: viewResults, details: viewDetails, settings: viewSettings, about: viewAbout }[S.view];
   v(m);
   scheduleFit();
 }
@@ -282,7 +298,11 @@ async function doScan() {
   const base = S.cfg.base.trim().replace(/^"|"$/g, '');
   if (!base) { toast('Enter a base folder first', 'bad'); $('#base')?.focus(); return; }
   S.report = null; S.outcome = null; S.listScroll = 0; // results and notes of an earlier scan must not outlive this one
-  S.scanning = true; S.base = base; S.view = 'home'; render(); status('Scanning…');
+  S.scanning = true; S.base = base; S.view = 'home';
+  main().inert = true;
+  $('#open-menu').disabled = true;
+  status('Scanning…');
+  const showProgress = setTimeout(() => { showScanProgress = true; render(); }, 150);
   const t0 = performance.now();
   try {
     const r = await call('start_scan', { opts: scanOptions(base) });
@@ -295,16 +315,22 @@ async function doScan() {
     if (r.skipped.length) toast(`${plural(r.skipped.length, 'folder')} could not be read and were left alone`);
     go('results');
   } catch (e) { S.scanning = false; status('Scan failed'); fail(e); render(); }
+  finally { clearTimeout(showProgress); showScanProgress = false; }
 }
 
 /* ---------- results ---------- */
 // Lower-cased path cached once per folder: sorting and filtering 200k rows must not re-lowercase.
 function indexReport(r) { for (const f of r.folders) f.lp = f.path.toLowerCase(); return r; }
+let sortedResults;
 function derive() {
+  const folders = S.report.folders;
+  if (sortedResults?.folders !== folders || sortedResults.key !== S.sortKey || sortedResults.dir !== S.sortDir) {
+    const value = S.sortKey === 'path' ? (f) => f.lp : (f) => f.modified ?? 0;
+    const rows = folders.slice().sort((a, b) => (value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0) * S.sortDir);
+    sortedResults = { folders, key: S.sortKey, dir: S.sortDir, rows };
+  }
   const q = S.filter.toLowerCase();
-  const rows = (q ? S.report.folders.filter((f) => f.lp.includes(q)) : S.report.folders.slice());
-  const val = { path: (f) => f.lp, age: (f) => f.modified ?? 0 }[S.sortKey];
-  return rows.sort((a, b) => (val(a) < val(b) ? -1 : val(a) > val(b) ? 1 : 0) * S.sortDir);
+  return q ? sortedResults.rows.filter((f) => f.lp.includes(q)) : sortedResults.rows;
 }
 
 const fmtDate = (sec) => { if (!sec) return ''; const d = new Date(sec * 1000), z = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
@@ -674,6 +700,13 @@ function viewAbout(m) {
   const keys = [['Ctrl+Enter', 'Find'], ['Ctrl+O', 'Browse for a folder'], ['Ctrl+F', 'Filter results'], ['Ctrl+A', 'Select all rows'], ['Click / Ctrl+click / Shift+click', 'Select rows'], ['Space', 'Check or uncheck the selected rows'], ['Ctrl+C', 'Copy the selected paths'], ['Delete', 'Delete checked'], ['Ctrl+S', 'Save checked paths'], ['Esc', 'Back']];
   m.append(h('div', { class: 'page' }, pageHead('About'),
     h('div', { class: 'box' }, h('dl', { class: 'kv' }, h('dt', { text: 'Version' }), h('dd', { text: S.version || '—' }), )),
+    h('h2', { text: 'Quick start' }),
+    h('ol', { class: 'box quick-start' },
+      h('li', { text: 'Browse for a base folder or drop one onto the window, then choose Find.' }),
+      h('li', { text: 'Review the checked results. Use the filter or Top-most only to narrow the list.' }),
+      h('li', { text: 'Send checked folders to the Recycle Bin, or choose permanent deletion when you are sure.' })),
+    h('h2', { text: 'Explorer and help' }),
+    h('div', { class: 'box' }, h('p', { text: 'Enable the context menu to scan from Explorer. Use the bug icon in the title bar to open a report on GitHub.' })),
     h('h2', { text: 'Keyboard' }),
     h('div', { class: 'box' }, h('dl', { class: 'kv' }, ...keys.flatMap(([k, v]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: v })])))));
 }
@@ -755,6 +788,7 @@ async function boot() {
   } catch { /* first run */ }
   applyTheme();
   $('#win-min').onclick = () => call('window_minimize');
+  $('#report-bug').onclick = () => once('report-bug', () => call('open_bug_report').catch(fail));
   $('#win-close').onclick = async () => { await flushSave(); call('window_close'); };
   $('#open-menu').onclick = async (e) => { if (busy()) return; const b = e.currentTarget; await refreshShell(); mainMenu(b); };
   listen('scan-progress', (p) => { const el = $('#scan-path'); if (el) el.textContent = p.path; const c = $('#scan-count'); if (c) c.textContent = `${p.count.toLocaleString()} folders read`; status(`Scanning… ${p.count.toLocaleString()} folders`); });

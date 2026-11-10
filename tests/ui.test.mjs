@@ -36,6 +36,7 @@ let fails = 0;
 const ok = (c, msg) => { console.log((c ? 'PASS ' : 'FAIL ') + msg); if (!c) fails++; };
 const calls = (name) => page.evaluate((n) => window.__calls.filter((c) => c[0] === n).map((c) => c[1]), name);
 const lastFit = async () => (await calls('fit_window')).at(-1);
+const compactFitWidth = 452; // 430 px of content, plus the 1 px border and 10 px shadow gutter on each side.
 const saved = async () => { await page.waitForTimeout(450); return page.evaluate(() => JSON.parse(window.__settings())); };
 
 await page.waitForSelector('#bridge.ok');
@@ -48,15 +49,18 @@ await page.dblclick('#titlebar .tb-name');
 ok((await calls('window_toggle_maximize')).length === 0, 'double-clicking the titlebar does nothing');
 const conf = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8')).app.windows[0];
 ok(conf.resizable === false && conf.maximizable === false, 'window is configured as not resizable and not maximizable');
-ok(conf.backgroundColor === '#11151d', 'the native window background is dark, so growing the window never flashes white');
+ok(conf.transparent && conf.backgroundColor === '#00000000', 'the native background lets the compact frame and shadow show');
 ok(conf.visible === false && conf.shadow === false, 'native startup stays hidden and has no large shadow');
 const startupFit = (await calls('fit_window'))[0];
 ok(startupFit?.show === true && startupFit.width <= 460 && startupFit.height < 300, 'the first fit reveals the compact home window');
+await page.getByRole('button', { name: 'Report a bug' }).click();
+ok((await calls('open_bug_report')).length === 1, 'the title-bar bug button opens the report through the native bridge');
 ok(await page.locator('.home .check').count() === 2, 'home shows just the two v1.3 checkboxes by default');
 ok(await page.locator('.more').count() === 0, 'extra options hidden until asked for');
 await page.waitForTimeout(100);
 let fit = await lastFit();
-ok(fit.width === 430 && fit.height > 150 && fit.height < 290, `home window is compact and fits its content (${fit.width}x${fit.height})`);
+ok(fit.width === compactFitWidth && fit.height > 150 && fit.height < 290, `home window is compact and fits its content (${fit.width}x${fit.height})`);
+ok(await page.locator('#app').evaluate((el) => el.clientWidth === 430 && getComputedStyle(el).borderLeftWidth === '1px'), 'the new border preserves the original compact content width');
 await shot('home');
 
 const box = async (sel) => page.locator(sel).first().boundingBox();
@@ -122,7 +126,7 @@ await page.click('.pagehead >> text=Back');
 await page.waitForSelector('.home');
 await page.waitForTimeout(450);
 fit = await lastFit();
-ok(fit.width === 430 && fit.height < 290, `Back returns to the first screen at its own size (${fit.width}x${fit.height})`);
+ok(fit.width === compactFitWidth && fit.height < 290, `Back returns to the first screen at its own size (${fit.width}x${fit.height})`);
 ok((await calls('fit_window')).length === homeFits + 2, 'opening and closing the options is exactly two resizes: there and back');
 
 // ---- missing folder: friendly message like the original, no scan
@@ -172,7 +176,7 @@ await page.click('text=Back');
 await page.waitForSelector('.home');
 await page.waitForTimeout(250);
 fit = await lastFit();
-ok(fit.width === 430, `Back refits the window to the home size (${fit.width})`);
+ok(fit.width === compactFitWidth, `Back refits the window to the home size (${fit.width})`);
 await page.keyboard.press('Control+Enter');
 await page.waitForSelector('.rhead .title');
 await page.waitForTimeout(250);
@@ -390,8 +394,18 @@ ok(true, 'browser shortcuts pressed without side effects');
 await page.click('text=Back');
 await page.waitForSelector('.home');
 await page.fill('#base', 'C:\\Empty');
+await page.evaluate(() => {
+  window.__flashedProgress = false;
+  const main = document.querySelector('#main');
+  const observer = new MutationObserver(() => {
+    window.__flashedProgress ||= !!main.querySelector('.scanning');
+    if (main.querySelector('.emptystate')) observer.disconnect();
+  });
+  observer.observe(main, { childList: true });
+});
 await page.keyboard.press('Control+Enter');
 await page.waitForSelector('.emptystate');
+ok(!(await page.evaluate(() => window.__flashedProgress)), 'a quick scan skips the progress-page flash');
 await page.waitForTimeout(450);
 fit = await lastFit();
 ok(Math.abs(fit.width - 1056) <= 2 && Math.abs(fit.height - 648) <= 2, `the results screen keeps its size even when nothing is found (${fit.width}x${fit.height})`);
@@ -412,7 +426,7 @@ await page.keyboard.press('Escape');
 await page.waitForSelector('.home');
 
 await page.waitForTimeout(450);
-ok(await page.locator('#main.swap').count() === 0, 'content is visible again after every resize');
+ok(await page.locator('#main.resizing').count() === 0, 'content is visible again after every resize');
 ok(await page.evaluate(() => { const i = document.querySelector('img.tb-icon'); return i && i.complete && i.naturalWidth > 0 && i.getBoundingClientRect().width > 8; }), 'titlebar shows the new icon (loads as an image)');
 await page.keyboard.press('Control+Enter');
 await page.waitForSelector('.rhead .title');
@@ -422,7 +436,7 @@ await page.click('#open-menu'); await page.click('.menu >> text=Settings');
 await page.click('.frow:has-text("Theme") .dd-btn'); await page.click('.menu >> text=Light');
 ok((await page.getAttribute('html', 'data-theme')) === 'light', 'the theme switch in Settings works');
 await page.waitForTimeout(100);
-ok((await calls('set_background')).some((c) => c.r === 241 && c.g === 243 && c.b === 248), 'the native window background follows the theme');
+ok(await page.locator('#app').evaluate((el) => getComputedStyle(el).backgroundColor === 'rgb(241, 243, 248)'), 'the app surface follows the theme');
 await shot('light');
 await page.click('.frow:has-text("Theme") .dd-btn'); await page.click('.menu >> text=Dark');
 await page.keyboard.press('Escape');
@@ -439,6 +453,7 @@ for (const [label, h1] of [['Settings', 'Settings'], ['About', 'About']]) {
   }
   if (h1 === 'About') {
     const t = await page.textContent('.page');
+    ok(t.includes('Quick start') && t.includes('Recycle Bin'), 'About contains a short guide to scanning and deleting');
     ok(!/Built with|Rust|HTML|Simon|simonwai|Based on/i.test(t), 'About mentions neither the tech nor the old app');
   }
   await page.keyboard.press('Escape');
@@ -569,7 +584,7 @@ await page.keyboard.press('Escape');
   await p7.evaluate(() => { window.__failFits = 1; });
   await p7.click('text=Back'); await p7.waitForSelector('.home');
   await p7.waitForTimeout(2500);
-  ok(await p7.evaluate(() => innerWidth) === 430, 'a refused resize (minimized window) is retried until the first-screen size is applied');
+  ok(await p7.evaluate(() => innerWidth) === compactFitWidth, 'a refused resize (minimized window) is retried until the first-screen size is applied');
   await p7.close();
 }
 

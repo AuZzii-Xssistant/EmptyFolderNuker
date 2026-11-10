@@ -57,7 +57,7 @@ fn main() {
             commands::load_settings,
             commands::store_settings,
             commands::fit_window,
-            commands::set_background,
+            commands::open_bug_report,
             commands::window_minimize,
             commands::window_close,
             commands::confirm_exit,
