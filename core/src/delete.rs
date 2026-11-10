@@ -1,10 +1,10 @@
 use crate::protect;
-use crate::scan::{has_link_ancestor, is_link, valid_junk_pattern, wildcard, ScanOptions, ScanReport};
+use crate::scan::{has_link_ancestor, is_link, JunkStamp, NameRules, ScanOptions, ScanReport};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -40,12 +40,28 @@ fn key(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn is_junk_name(name: &str, junk: &[String]) -> bool {
-    junk.iter().any(|p| wildcard(p, name))
+struct Contents<'a> {
+    junk: NameRules,
+    scan: Option<&'a DeletePolicy>,
 }
 
-/// Delete the given folders. A folder that has gained content since the scan is left alone, so a
-/// stale result list can never cost data. Shallowest first: when a parent is removed, every listed
+impl Contents<'_> {
+    fn allows_dir(&self, path: &Path) -> bool {
+        self.scan.is_none_or(|scan| scan.allowed.contains(&key(path)))
+    }
+
+    fn allows_file(&self, entry: &fs::DirEntry) -> bool {
+        let Some(scan) = self.scan else { return self.junk.matches(&entry.file_name().to_string_lossy()) };
+        if scan.junk_files.is_empty() {
+            return false;
+        }
+        let path = entry.path();
+        scan.junk_files.get(&path).is_some_and(|expected| JunkStamp::read(&path).as_ref() == Some(expected))
+    }
+}
+
+/// Delete the given folders after checking their current contents. Use `DeletePolicy` to also
+/// reject files absent from the scan. Shallowest first: when a parent is removed, every listed
 /// folder inside it is already gone, so it is reported as deleted without another file system call
 /// (one Recycle Bin entry instead of thousands, and no repeated re-reading of the same tree).
 /// Setting `cancel` stops after the current folder. Junk patterns that are too broad are ignored.
@@ -67,11 +83,11 @@ fn delete_checked(
     junk: &[String],
     protect: bool,
     follow_links: bool,
-    allowed: Option<&HashSet<String>>,
+    scan: Option<&DeletePolicy>,
     cancel: &AtomicBool,
     on_item: &mut dyn FnMut(&DeleteResult),
 ) -> Vec<DeleteResult> {
-    let junk: Vec<String> = junk.iter().filter(|p| valid_junk_pattern(p)).cloned().collect();
+    let contents = Contents { junk: NameRules::compile(junk, true), scan };
     let mut order: Vec<&String> = paths.iter().collect();
     order.sort_by_key(|p| Path::new(p.as_str()).components().count());
     let mut removed: HashSet<String> = HashSet::new();
@@ -97,9 +113,9 @@ fn delete_checked(
                 Err(e) if e.kind() == io::ErrorKind::NotFound => DeleteOutcome::AlreadyGone,
                 Err(e) => DeleteOutcome::Failed(friendly(&e)),
                 Ok(m) if !m.is_dir() || is_link(&m) => DeleteOutcome::NotEmpty,
-                Ok(_) if !only_empty_dirs(path, &junk, allowed) => DeleteOutcome::NotEmpty,
+                Ok(_) if !only_empty_dirs(path, &contents) => DeleteOutcome::NotEmpty,
                 Ok(_) => {
-                    let o = remove(path, mode, &junk, allowed);
+                    let o = remove(path, mode, &contents);
                     if o == DeleteOutcome::Deleted {
                         removed.insert(key(path));
                     }
@@ -114,13 +130,13 @@ fn delete_checked(
     out
 }
 
-fn remove(path: &Path, mode: DeleteMode, junk: &[String], allowed: Option<&HashSet<String>>) -> DeleteOutcome {
+fn remove(path: &Path, mode: DeleteMode, contents: &Contents<'_>) -> DeleteOutcome {
     match mode {
         DeleteMode::Recycle => match trash::delete(path) {
             Ok(()) => DeleteOutcome::Deleted,
             Err(e) => DeleteOutcome::Failed(friendly_trash(&e.to_string())),
         },
-        DeleteMode::Permanent => match remove_tree_checked(path, junk, allowed) {
+        DeleteMode::Permanent => match remove_tree_checked(path, contents) {
             Ok(()) => DeleteOutcome::Deleted,
             Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => DeleteOutcome::NotEmpty,
             Err(e) => DeleteOutcome::Failed(friendly(&e)),
@@ -166,15 +182,14 @@ fn remove_dir_force(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Bottom-up removal. Only files that match a junk pattern are unlinked, and folders are removed with
-/// `remove_dir`, which refuses a folder that is not empty. So a file that appears after the emptiness
-/// check (created by another program) is never destroyed: the removal stops with "not empty" instead.
+/// Bottom-up removal. Only allowed junk files are unlinked. `remove_dir` refuses any directory
+/// that still contains an entry, including files created during the removal.
 #[cfg(test)]
 pub(crate) fn remove_tree(dir: &Path, junk: &[String], _follow_links: bool) -> io::Result<()> {
-    remove_tree_checked(dir, junk, None)
+    remove_tree_checked(dir, &Contents { junk: NameRules::compile(junk, true), scan: None })
 }
 
-fn remove_tree_checked(dir: &Path, junk: &[String], allowed: Option<&HashSet<String>>) -> io::Result<()> {
+fn remove_tree_checked(dir: &Path, contents: &Contents<'_>) -> io::Result<()> {
     let changed = || io::Error::new(io::ErrorKind::DirectoryNotEmpty, "folder contents changed");
     if is_link(&fs::symlink_metadata(dir)?) {
         return Err(changed());
@@ -185,9 +200,9 @@ fn remove_tree_checked(dir: &Path, junk: &[String], allowed: Option<&HashSet<Str
         let p = e.path();
         if is_link(&meta) {
             return Err(changed());
-        } else if meta.is_dir() && allowed.is_none_or(|paths| paths.contains(&key(&p))) {
-            remove_tree_checked(&p, junk, allowed)?;
-        } else if meta.is_file() && is_junk_name(&e.file_name().to_string_lossy(), junk) {
+        } else if meta.is_dir() && contents.allows_dir(&p) {
+            remove_tree_checked(&p, contents)?;
+        } else if meta.is_file() && contents.allows_file(&e) {
             remove_file_force(&p)?;
         } else {
             return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, "folder is not empty"));
@@ -212,10 +227,8 @@ fn remove_file_force(p: &Path) -> io::Result<()> {
     }
 }
 
-/// True when the tree below `dir` holds no files except junk ones. Anything unreadable counts as
-/// "not empty". Re-checked at delete time, so a stale scan result can never remove a folder that
-/// gained content.
-fn only_empty_dirs(dir: &Path, junk: &[String], allowed: Option<&HashSet<String>>) -> bool {
+/// Check the live tree immediately before removal. Unreadable entries count as content.
+fn only_empty_dirs(dir: &Path, contents: &Contents<'_>) -> bool {
     let Ok(rd) = fs::read_dir(dir) else { return false };
     for e in rd {
         let Ok(e) = e else { return false };
@@ -225,10 +238,10 @@ fn only_empty_dirs(dir: &Path, junk: &[String], allowed: Option<&HashSet<String>
         }
         if meta.is_dir() {
             let p = e.path();
-            if allowed.is_some_and(|paths| !paths.contains(&key(&p))) || !only_empty_dirs(&p, junk, allowed) {
+            if !contents.allows_dir(&p) || !only_empty_dirs(&p, contents) {
                 return false;
             }
-        } else if !(meta.is_file() && is_junk_name(&e.file_name().to_string_lossy(), junk)) {
+        } else if !(meta.is_file() && contents.allows_file(&e)) {
             return false;
         }
     }
@@ -241,7 +254,7 @@ fn only_empty_dirs(dir: &Path, junk: &[String], allowed: Option<&HashSet<String>
 #[derive(Clone, Debug, Default)]
 pub struct DeletePolicy {
     allowed: HashSet<String>,
-    junk: Vec<String>,
+    junk_files: HashMap<PathBuf, JunkStamp>,
     protect: bool,
     follow_links: bool,
 }
@@ -250,7 +263,7 @@ impl DeletePolicy {
     pub fn from_scan(report: &ScanReport, opts: &ScanOptions) -> Self {
         Self {
             allowed: report.folders.iter().map(|f| f.path.clone()).collect(),
-            junk: if opts.ignore_junk { opts.junk_patterns.iter().filter(|p| valid_junk_pattern(p)).cloned().collect() } else { vec![] },
+            junk_files: if opts.ignore_junk { report.junk_files.clone() } else { HashMap::new() },
             protect: opts.skip_protected,
             follow_links: !opts.skip_reparse,
         }
@@ -270,7 +283,7 @@ impl DeletePolicy {
             on_item(&r);
             out.push(r);
         }
-        out.extend(delete_checked(&ok, mode, &self.junk, self.protect, self.follow_links, Some(&self.allowed), cancel, on_item));
+        out.extend(delete_checked(&ok, mode, &[], self.protect, self.follow_links, Some(self), cancel, on_item));
         out
     }
 }

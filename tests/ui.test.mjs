@@ -53,6 +53,7 @@ ok(conf.transparent && conf.backgroundColor === '#00000000', 'the native backgro
 ok(conf.visible === false && conf.shadow === false, 'native startup stays hidden and has no large shadow');
 const startupFit = (await calls('fit_window'))[0];
 ok(startupFit?.show === true && startupFit.width <= 460 && startupFit.height < 300, 'the first fit reveals the compact home window');
+ok((await calls('bootstrap')).length === 1 && !(await calls('shell_status')).length, 'startup loads settings and launch arguments together and defers Explorer status');
 await page.getByRole('button', { name: 'Report a bug' }).click();
 ok((await calls('open_bug_report')).length === 1, 'the title-bar bug button opens GitHub Issues through the native bridge');
 ok(await page.locator('.home .check').count() === 2, 'home shows just the two v1.3 checkboxes by default');
@@ -127,13 +128,18 @@ await page.waitForSelector('.home');
 await page.waitForTimeout(450);
 fit = await lastFit();
 ok(fit.width === compactFitWidth && fit.height < 290, `Back returns to the first screen at its own size (${fit.width}x${fit.height})`);
-ok((await calls('fit_window')).length === homeFits + 2, 'opening and closing the options is exactly two resizes: there and back');
+const optionFits = (await calls('fit_window')).slice(homeFits);
+ok(optionFits.length === 2, `opening and closing the options is exactly two resizes: there and back (${optionFits.map(({ width, height }) => `${width}x${height}`).join(', ')})`);
 
-// ---- missing folder: friendly message like the original, no scan
+// ---- missing folder: no misleading success or blanket claim about its contents
 await page.fill('#base', 'C:\\Nope');
 await page.keyboard.press('Control+Enter');
-await page.waitForSelector('.toast.bad');
-ok((await page.textContent('.toast.bad')).includes('does not exist'), 'missing folder gives a clear message');
+await page.waitForSelector('.emptystate');
+ok((await page.textContent('.emptystate')).includes('No folders could be scanned'), 'missing folder is distinguished from a completed scan');
+await page.getByRole('button', { name: 'Skipped folders' }).click();
+ok((await page.textContent('.dtable')).includes('does not exist'), 'missing folder gives a clear reason');
+await page.getByRole('button', { name: 'Back' }).click();
+await page.getByRole('button', { name: 'Back' }).click();
 await page.waitForSelector('.home');
 
 // ---- scan
@@ -200,7 +206,7 @@ await page.fill('#filter', '');
 await page.dispatchEvent('#filter', 'input');
 await page.waitForTimeout(250);
 const qb = await page.locator('.rtools .btn').allTextContents();
-ok(JSON.stringify(qb) === JSON.stringify(['All', 'None', 'Invert']), 'only All, None and Invert sit next to the filter');
+ok(JSON.stringify(qb) === JSON.stringify(['All', 'None', 'Invert', 'Rescan']), 'Rescan sits beside the quick-select buttons');
 const fb = await box('#filter'), ab = await box('#btn-all');
 ok(Math.abs((fb.y + fb.height / 2) - (ab.y + ab.height / 2)) < 1.5, 'filter and quick-select buttons share one row');
 ok(await page.locator('text=⋯').count() === 0, 'the … button is gone');
@@ -475,7 +481,7 @@ ok(Math.abs(fit.width - Math.round(1920 * 0.7)) <= 2, `"Large" results window is
 await page.keyboard.press('Escape'); await page.waitForSelector('.home');
 
 // ---- shell integration: one click in the menu, no dialog
-ok((await calls('shell_status')).length > 0 && (await calls('shell_enable')).length === 0, 'launch reads the context-menu state without enabling it');
+ok((await calls('shell_status')).length > 0 && (await calls('shell_enable')).length === 0, 'opening the app menu reads the context-menu state without enabling it');
 await page.click('#open-menu');
 ok(await page.locator('.menu >> text=Enable context menu').count() === 1, 'menu offers Enable context menu');
 await page.click('.menu >> text=Enable context menu');
@@ -484,7 +490,7 @@ ok(await page.locator('.modal').count() === 0, 'enabling the context menu opens 
 ok((await calls('shell_enable')).length === 1, 'one click enables the context menu');
 await page.click('#open-menu');
 ok(await page.locator('.menu >> text=Disable context menu').count() === 1, 'the same menu item offers Disable');
-ok(await page.locator('.menu button').filter({ hasText: /^(Update|Repair|Install)/ }).count() === 0, 'copy management adds no menu actions');
+ok(await page.locator('.menu button').filter({ hasText: /^(Update|Repair|Install|Retry)/ }).count() === 0, 'a successful saved-copy check adds no menu actions');
 const mh = await page.locator('.menu button').first().evaluate((e) => e.getBoundingClientRect().height);
 ok(mh <= 24, `the menu is compact (${mh}px rows)`);
 await page.click('.menu >> text=Disable context menu');
@@ -492,6 +498,13 @@ await page.waitForFunction(() => document.querySelector('.toast')?.textContent.i
 ok((await calls('shell_disable')).length === 1, 'one click disables the context menu');
 await page.click('#open-menu');
 ok(await page.locator('.menu >> text=Enable context menu').count() === 1, 'enabling is available again after disabling');
+await page.keyboard.press('Escape');
+await page.evaluate(() => { window.__refreshFailed = true; });
+await page.click('#open-menu');
+await page.click('.menu >> text=Retry saved copy update');
+ok((await calls('shell_retry_refresh')).length === 1 && (await calls('shell_enable')).length === 1, 'retrying a failed saved copy does not enable Explorer integration');
+await page.click('#open-menu');
+ok(await page.locator('.menu >> text=Retry saved copy update').count() === 0, 'the fallback disappears after a successful retry');
 await page.keyboard.press('Escape');
 
 // ---- old saved settings: a leftover "permanent" is put back to the Recycle Bin once
@@ -626,6 +639,84 @@ await page.keyboard.press('Escape');
   await nested.locator('.modal').getByRole('button', { name: 'Cancel', exact: true }).click();
   ok(!(await nested.evaluate(() => window.__calls.some(([name]) => name === 'delete_paths'))), 'cancel keeps both the parent and its unchecked child');
   await nested.close();
+}
+
+// Large filters debounce. Bulk actions must use the current query, and a new scan invalidates it.
+{
+  const large = await browser.newPage();
+  const faults = [];
+  large.on('pageerror', (e) => faults.push(e.message));
+  await large.addInitScript(() => {
+    window.__seed = JSON.stringify({ base: 'C:\\Large', resultsSize: 'constructor', constructor: false });
+  });
+  await large.addInitScript(mock);
+  await large.goto(base);
+  await large.waitForSelector('.home');
+  await large.keyboard.press('Control+Enter');
+  await large.waitForSelector('#btn-rescan');
+  await large.click('#btn-none');
+  const bulkCount = await large.evaluate(() => {
+    const filter = document.querySelector('#filter');
+    filter.value = '\\foobar';
+    filter.dispatchEvent(new Event('input'));
+    document.querySelector('#btn-all').click();
+    return document.querySelector('#foot-count').textContent;
+  });
+  ok(bulkCount.startsWith('1 checked'), 'an immediate bulk selection uses the latest large-list filter');
+  const scanBefore = await large.evaluate(() => window.__calls.find(([name]) => name === 'start_scan')[1].opts);
+  await large.evaluate(() => {
+    const filter = document.querySelector('#filter');
+    filter.value = 'old';
+    filter.dispatchEvent(new Event('input'));
+    document.querySelector('#btn-rescan').click();
+  });
+  await large.waitForFunction(() => document.querySelector('#foot-count')?.textContent === '0 checked');
+  await large.waitForTimeout(200);
+  ok(await large.inputValue('#filter') === '' && faults.length === 0, 'Rescan clears the previous query and checkmarks without a stale filter callback');
+  const scanAfter = await large.evaluate(() => window.__calls.filter(([name]) => name === 'start_scan').at(-1)[1].opts);
+  ok(JSON.stringify(scanBefore) === JSON.stringify(scanAfter), 'Rescan reuses exactly the previous folder and options');
+  await large.getByRole('button', { name: 'Skipped folders' }).click();
+  ok((await large.textContent('.dtable')).includes('Access denied'), 'partial results expose a readable skipped-folder reason');
+  await large.getByRole('button', { name: 'Back' }).click();
+  await large.getByRole('button', { name: 'Back' }).click();
+  await large.fill('#base', 'C:\\Partial');
+  await large.keyboard.press('Control+Enter');
+  await large.waitForSelector('.emptystate');
+  ok((await large.textContent('.emptystate')).includes('Some locations could not be checked'), 'an incomplete scan without hits explains that locations were skipped');
+  await large.getByRole('button', { name: 'Back' }).click();
+  await large.fill('#base', 'C:\\Cancelled');
+  await large.keyboard.press('Control+Enter');
+  await large.waitForFunction(() => document.querySelector('#status-text')?.textContent.startsWith('Scan cancelled'));
+  await large.evaluate(() => window.__emit('scan-progress', { path: 'old', count: 10 }));
+  ok((await large.textContent('#status-text')).startsWith('Scan cancelled'), 'late progress does not overwrite the cancelled scan status');
+  await large.close();
+}
+
+{
+  const instances = await browser.newPage();
+  await instances.addInitScript(mock);
+  await instances.goto(base);
+  await instances.click('#open-menu');
+  await instances.getByRole('menuitem', { name: 'Settings', exact: true }).click();
+  const toggle = instances.getByRole('checkbox', { name: 'Allow multiple instances' });
+  ok(await toggle.getAttribute('aria-checked') === 'false', 'multiple instances are off by default');
+  await toggle.click();
+  await instances.waitForFunction(() => JSON.parse(window.__settings()).allowMultipleInstances === true);
+  ok(await instances.evaluate(() => window.__calls.filter(([name]) => name === 'store_settings').at(-1)[1].allowMultiple === true), 'the instance setting is explicitly saved');
+  await instances.getByRole('button', { name: 'Back' }).click();
+  await instances.evaluate(() => {
+    window.__forwardedFolders = ['C:\\Data'];
+    window.__emit('folders-forwarded', null);
+  });
+  await instances.waitForSelector('.scanning');
+  await instances.evaluate(() => {
+    window.__forwardedFolders = ['C:\\Empty'];
+    window.__emit('folders-forwarded', null);
+  });
+  await instances.waitForSelector('.emptystate');
+  const scanned = await instances.evaluate(() => window.__calls.filter(([name]) => name === 'start_scan').map(([, args]) => args.opts.roots[0]));
+  ok(scanned.join(',') === 'C:\\Data,C:\\Empty', 'Explorer launches reuse the window and wait for an active scan');
+  await instances.close();
 }
 
 ok(await page.locator('select, input[type=checkbox], input[type=radio], input[type=range], input[type=file]').count() === 0, 'no native form controls');

@@ -4,7 +4,7 @@ import { h, checkbox, dropdown, radios, menu, closeMenu, toast, confirmBox } fro
 const DEFAULTS = {
   base: '', recurse: true, nestedEmpty: true, ignoreJunk: false, junkNames: 'Thumbs.db, desktop.ini, .DS_Store',
   skipNames: '', includeRoot: false, skipHidden: false, skipSystem: true, skipProtected: true, skipReparse: true, compact: true, showModified: true, resultsSize: 'default',
-  mode: 'recycle', exitAfter: false, autoCheck: true, confirmDelete: true, theme: 'dark', v: 5,
+  mode: 'recycle', exitAfter: false, autoCheck: true, confirmDelete: true, theme: 'dark', allowMultipleInstances: false, v: 5,
 };
 const S = { cfg: structuredClone(DEFAULTS), view: 'home', report: null, base: '', checked: new Set(), filter: '', sortKey: 'path', sortDir: 1, cursor: 0, scanning: false, deleting: false, shown: [], sel: new Set(), anchor: 0, editJunk: false, lastReq: null, version: '', mode: null, shell: null, undo: null, del: { done: 0, total: 0, path: '' }, prev: null, outcome: null, refits: 0, listScroll: 0 };
 const JUNK_DEFAULT = DEFAULTS.junkNames;
@@ -20,9 +20,24 @@ const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
 const fail = (e) => toast(String(e), 'bad');
 
 /* ---------- settings ---------- */
-let saveTimer;
-function save() { clearTimeout(saveTimer); saveTimer = setTimeout(() => call('store_settings', { json: JSON.stringify(S.cfg) }).catch(() => {}), 120); }
-async function flushSave() { clearTimeout(saveTimer); await call('store_settings', { json: JSON.stringify(S.cfg) }).catch(() => {}); }
+let saveTimer, settingsDirty = false;
+let settingsWrite = Promise.resolve();
+let pendingInstancePreference;
+function save() {
+  settingsDirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, 120);
+}
+function flushSave() {
+  clearTimeout(saveTimer);
+  if (!settingsDirty) return settingsWrite;
+  settingsDirty = false;
+  const json = JSON.stringify(S.cfg);
+  const allowMultiple = pendingInstancePreference;
+  pendingInstancePreference = undefined;
+  settingsWrite = settingsWrite.then(() => call('store_settings', { json, allowMultiple })).catch((e) => fail(`Could not save settings: ${e}`));
+  return settingsWrite;
+}
 function set(k, v) { S.cfg[k] = v; save(); }
 const applyTheme = () => {
   document.documentElement.dataset.theme = S.cfg.theme;
@@ -65,7 +80,7 @@ const DEF = {
 // Results size is a share of the usable screen (the window cannot be dragged, so this is the control).
 const RESULT_SHARE = { small: [0.45, 0.5], default: [0.55, 0.6], large: [0.7, 0.75] };
 const density = () => (S.cfg.compact ? 'compact' : 'comfortable');
-const kind = () => (S.scanning || S.deleting ? 'busy' : S.view === 'results' || S.view === 'details' ? 'results' : S.view === 'home' ? 'home' : S.view === 'options' ? 'options' : 'page');
+const kind = () => (S.scanning || S.deleting ? 'busy' : ['results', 'details', 'scan-details'].includes(S.view) ? 'results' : S.view === 'home' ? 'home' : S.view === 'options' ? 'options' : 'page');
 const bounds = () => ({ maxW: Math.max(380, screen.availWidth - 24), maxH: Math.max(240, screen.availHeight - 24) });
 function defaultSize(k) {
   const d = density(), { maxW, maxH } = bounds();
@@ -113,7 +128,9 @@ function requestSize(w, hgt, show) {
   const last = S.lastReq;
   if (last && last[0] === w && last[1] === hgt) return false;
   const size = S.lastReq = [w, hgt];
-  call('fit_window', { width: w, height: hgt, show }).catch(() => {
+  call('fit_window', { width: w, height: hgt, show }).then(() => {
+    setTimeout(() => { if (S.lastReq === size) verifySize(); }, 600);
+  }, () => {
     if (S.lastReq === size) { S.lastReq = null; setTimeout(verifySize, 1000); }
   });
   return true;
@@ -143,7 +160,6 @@ function fit(again = true, show = false) {
   if (show) main().classList.remove('resizing');
   const asked = requestSize(w, hgt, show);
   if (!show && !finishReveal) revealWhenSized(asked ? S.lastReq : null);
-  if (asked) setTimeout(verifySize, 600);
   // Second pass once the OS has applied the size: if the content measured differently, refit.
   if (again && k === 'home') setTimeout(() => {
     if (kind() !== k) return;
@@ -167,14 +183,41 @@ function adjustForModal() {
   }
 }
 let modalT;
-new MutationObserver(() => { clearTimeout(modalT); modalT = setTimeout(adjustForModal, 30); }).observe($('#layer'), { childList: true, subtree: true });
+new MutationObserver(() => {
+  clearTimeout(modalT);
+  modalT = setTimeout(adjustForModal, 30);
+  if (forwardedFolders.length) setTimeout(scanForwardedFolder, 0);
+}).observe($('#layer'), { childList: true, subtree: true });
 
-function go(view) { closeMenu(); if (view === 'home') S.outcome = null; S.view = view; render(); }
+function go(view) {
+  closeMenu();
+  if (view === 'home') {
+    S.report = null; S.outcome = null; S.shown = [];
+    S.checked.clear(); S.sel.clear();
+    sortedResults = undefined; resultWidth = undefined;
+  }
+  S.view = view;
+  render();
+}
 let lastKey = '';
 let showScanProgress = false;
 const busy = () => S.scanning || S.deleting;
+const forwardedFolders = [];
+function scanForwardedFolder() {
+  if (!forwardedFolders.length || busy() || $('#layer .scrim')) return;
+  set('base', forwardedFolders.shift());
+  doScan();
+}
+async function receiveForwardedFolders() {
+  try {
+    forwardedFolders.push(...await call('take_forwarded_folders'));
+    scanForwardedFolder();
+  } catch (error) { fail(error); }
+}
 function render() {
   const m = main();
+  cancelPendingFilter();
+  listWatch?.disconnect();
   m.inert = false;
   $('#open-menu').disabled = busy(); // menu, settings and pages make no sense while a scan or delete runs
   const key = kind() + S.view;
@@ -185,9 +228,10 @@ function render() {
     lastKey = key;
   }
   m.replaceChildren();
-  const v = S.deleting ? viewDeleting : showScanProgress && S.scanning ? viewScanning : { home: viewHome, options: viewOptions, results: viewResults, details: viewDetails, settings: viewSettings, about: viewAbout }[S.view];
+  const v = S.deleting ? viewDeleting : showScanProgress && S.scanning ? viewScanning : { home: viewHome, options: viewOptions, results: viewResults, details: viewDetails, 'scan-details': viewDetails, settings: viewSettings, about: viewAbout }[S.view];
   v(m);
   scheduleFit();
+  if (forwardedFolders.length && !busy()) setTimeout(scanForwardedFolder, 0);
 }
 function pageHead(title, extra) {
   return h('div', { class: 'pagehead' }, h('button', { class: 'btn', type: 'button', text: '‹ Back', onClick: () => go(S.report && S.view !== 'home' && S.prev === 'results' ? 'results' : 'home') }), h('h1', { text: title }), extra);
@@ -284,7 +328,12 @@ function viewDeleting(m) {
     h('div', { class: 'path', id: 'del-path', text: d.path }),
     h('div', { class: 'progress det' }, h('i', { id: 'del-bar', style: `width:${d.total ? (d.done / d.total) * 100 : 0}%` })),
     h('div', { class: 'count', id: 'del-count', text: `${d.done.toLocaleString()} of ${d.total.toLocaleString()}` }),
-    h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', text: 'Stop', onClick: () => call('cancel_scan') }))));
+    h('div', { class: 'actions' }, h('button', { class: 'btn', type: 'button', text: 'Stop', onClick: (e) => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Stopping after current folder…';
+      call('cancel_scan').catch((error) => { button.disabled = false; button.textContent = 'Stop'; fail(error); });
+    } }))));
 }
 
 function scanOptions(base) {
@@ -293,28 +342,38 @@ function scanOptions(base) {
     excludePatterns: names(c.skipNames), minAgeDays: 0, maxDepth: 0, includeRoot: c.includeRoot,
     skipHidden: c.skipHidden, skipSystem: c.skipSystem, skipProtected: c.skipProtected, skipReparse: c.skipReparse };
 }
-async function doScan() {
-  if (S.scanning || S.deleting) return;
+let lastScan;
+function doScan() {
   const base = S.cfg.base.trim().replace(/^"|"$/g, '');
   if (!base) { toast('Enter a base folder first', 'bad'); $('#base')?.focus(); return; }
-  S.report = null; S.outcome = null; S.listScroll = 0; // results and notes of an earlier scan must not outlive this one
-  S.scanning = true; S.base = base; S.view = 'home';
+  return runScan(scanOptions(base));
+}
+function rescan() { if (lastScan) return runScan(lastScan, true); }
+async function runScan(opts, rescanning = false) {
+  if (S.scanning || S.deleting) return;
+  closeMenu();
+  lastScan = opts;
+  cancelPendingFilter();
+  S.report = null; S.outcome = null; S.listScroll = 0; S.shown = [];
+  sortedResults = undefined; resultWidth = undefined;
+  S.checked.clear(); S.sel.clear();
+  S.scanning = true; S.base = opts.roots[0];
   main().inert = true;
   $('#open-menu').disabled = true;
   status('Scanning…');
   const showProgress = setTimeout(() => { showScanProgress = true; render(); }, 150);
   const t0 = performance.now();
   try {
-    const r = await call('start_scan', { opts: scanOptions(base) });
+    const r = await call('start_scan', { opts });
     S.scanning = false;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    status(`Found ${plural(r.folders.length, 'empty folder')} · ${plural(r.scanned, 'folder')} read in ${secs}s`);
-    if (r.cancelled) { render(); return; }
+    if (r.cancelled) { status(`Scan cancelled · ${plural(r.scanned, 'folder')} read`); go('home'); return; }
+    const skipped = r.skipped.length ? ` · ${plural(r.skipped.length, 'folder')} skipped` : '';
+    status(`Found ${plural(r.folders.length, 'empty folder')} · ${plural(r.scanned, 'folder')} read in ${secs}s${skipped}`);
     S.report = indexReport(r); S.filter = ''; S.cursor = 0; S.sel = new Set(); S.anchor = 0; resetOverrides();
-    S.checked = new Set(S.cfg.autoCheck ? r.folders.map((f) => f.path) : []);
-    if (r.skipped.length) toast(`${plural(r.skipped.length, 'folder')} could not be read and were left alone`);
+    S.checked = new Set(!rescanning && S.cfg.autoCheck ? r.folders.map((f) => f.path) : []);
     go('results');
-  } catch (e) { S.scanning = false; status('Scan failed'); fail(e); render(); }
+  } catch (e) { S.scanning = false; status('Scan failed'); go('home'); fail(e); }
   finally { clearTimeout(showProgress); showScanProgress = false; }
 }
 
@@ -322,6 +381,7 @@ async function doScan() {
 // Lower-cased path cached once per folder: sorting and filtering 200k rows must not re-lowercase.
 function indexReport(r) { for (const f of r.folders) f.lp = f.path.toLowerCase(); return r; }
 let sortedResults;
+let resultWidth;
 function derive() {
   const folders = S.report.folders;
   if (sortedResults?.folders !== folders || sortedResults.key !== S.sortKey || sortedResults.dir !== S.sortDir) {
@@ -342,12 +402,17 @@ function measureChar() {
 }
 
 function viewEmpty(m) {
+  const incomplete = S.report.skipped.length > 0;
   m.append(h('div', { class: 'emptystate' },
-    h('div', { class: 'big', text: 'No empty folders found' }),
-    h('div', { class: 'muted', text: 'Everything under ' }, h('span', { class: 'mono selectable', text: S.base }), ' holds something.'),
-    S.report.skipped && S.report.skipped.length ? h('div', { class: 'faint tip', text: `${plural(S.report.skipped.length, 'folder')} could not be scanned (protected or unreadable) and were left alone.` }) : null,
-    S.cfg.ignoreJunk ? null : h('div', { class: 'faint tip' }, 'Tip: folders holding only Thumbs.db or desktop.ini count as empty if you turn that on in ', h('button', { class: 'link', type: 'button', text: 'More options', onClick: () => openPage('options') }), '.'),
-    h('div', { class: 'actions' }, h('span', { class: 'fill' }), h('button', { class: 'btn', type: 'button', text: 'Rescan', onClick: doScan }), h('button', { class: 'btn primary', type: 'button', text: 'Back', onClick: () => go('home') }))));
+    h('div', { class: 'big', text: incomplete && !S.report.scanned ? 'No folders could be scanned' : 'No empty folders found' }),
+    h('div', { class: 'muted' }, incomplete ? 'Some locations could not be checked.' : 'No folders matched the scan options under ', incomplete ? null : h('span', { class: 'mono selectable', text: S.base })),
+    incomplete ? skippedStrip() : null,
+    incomplete || lastScan.ignoreJunk ? null : h('div', { class: 'faint tip' }, 'Tip: folders holding only Thumbs.db or desktop.ini count as empty if you turn that on in ', h('button', { class: 'link', type: 'button', text: 'More options', onClick: () => openPage('options') }), '.'),
+    h('div', { class: 'actions' }, h('span', { class: 'fill' }), h('button', { class: 'btn', type: 'button', text: 'Rescan', onClick: rescan }), h('button', { class: 'btn primary', type: 'button', text: 'Back', onClick: () => go('home') }))));
+}
+function skippedStrip() {
+  return h('div', { class: 'rnote' }, h('span', { class: 'txt', text: `${plural(S.report.skipped.length, 'folder')} skipped` }), h('span', { class: 'fill' }),
+    h('button', { class: 'btn sm', type: 'button', text: 'Skipped folders', onClick: () => openPage('scan-details') }));
 }
 function outcomeStrip() {
   const o = S.outcome;
@@ -357,7 +422,11 @@ function outcomeStrip() {
   return strip;
 }
 function viewDetails(m) {
-  const o = S.outcome;
+  const scanDetails = S.view === 'scan-details';
+  const o = scanDetails ? {
+    summary: `${plural(S.report.skipped.length, 'folder')} skipped`,
+    issues: S.report.skipped.map(({ path, reason }) => ({ path, what: 'Skipped', why: reason })),
+  } : S.outcome;
   if (!o) { go(S.report ? 'results' : 'home'); return; }
   const v = o.view || (o.view = { key: 'path', dir: 1, q: '' }); // sort + filter live with the outcome, so Back/Details keeps them
   const text = (i) => `${i.what}: ${i.why}`;
@@ -377,15 +446,17 @@ function viewDetails(m) {
   function fill() {
     const rows = shown();
     sum.textContent = o.summary + (v.q ? ` · ${rows.length.toLocaleString()} of ${o.issues.length.toLocaleString()} shown` : '');
-    table.replaceChildren(h('div', { class: 'drow dhead' }, head('path', 'Folder Path'), head('why', 'What happened')),
-      ...rows.map((i) => h('div', { class: 'drow' }, h('span', { class: 'dpath mono', text: i.path }), h('span', { class: 'dwhy', text: text(i) }))));
+    const fragment = document.createDocumentFragment();
+    fragment.append(h('div', { class: 'drow dhead' }, head('path', 'Folder Path'), head('why', 'What happened')));
+    for (const i of rows) fragment.append(h('div', { class: 'drow' }, h('span', { class: 'dpath mono', text: i.path }), h('span', { class: 'dwhy', text: text(i) })));
+    table.replaceChildren(fragment);
     if (!rows.length) table.append(h('div', { class: 'dnone faint', text: 'Nothing matches the filter' }));
     table.dataset.shown = rows.length;
   }
   filter.addEventListener('input', () => { v.q = filter.value; clr.hidden = !v.q; fill(); });
   const copy = h('button', { class: 'btn', type: 'button', text: 'Copy', title: 'Copy the rows shown', onClick: () => copyText(shown().map((i) => `${i.path}\t${text(i)}`).join('\r\n')).then(() => toast('Copied')) });
   m.append(h('div', { class: 'page details' },
-    h('div', { class: 'pagehead' }, h('button', { class: 'btn', type: 'button', text: '‹ Back', onClick: () => go('results') }), h('h1', { text: 'Details' }),
+    h('div', { class: 'pagehead' }, h('button', { class: 'btn', type: 'button', text: '‹ Back', onClick: () => go('results') }), h('h1', { text: scanDetails ? 'Skipped folders' : 'Details' }),
       h('div', { class: 'inputgroup filtergroup dfg' }, filter, clr), copy),
     sum, table));
   fill();
@@ -397,16 +468,22 @@ function viewResults(m) {
   measureChar();
   const filter = h('input', { class: 'input selectable', id: 'filter', type: 'text', placeholder: 'Filter by path…  (Ctrl+F)', autocomplete: 'off', spellcheck: 'false' });
   filter.value = S.filter;
-  let filterTimer;
   const clr = h('button', { class: 'clr', type: 'button', title: 'Clear filter', 'aria-label': 'Clear filter', hidden: !S.filter, onClick: () => { filter.value = ''; filter.dispatchEvent(new Event('input')); filter.focus(); } });
   clr.innerHTML = '<svg viewBox="0 0 10 10"><path d="M1 1l8 8M9 1L1 9" stroke="currentColor" fill="none"/></svg>';
   filter.addEventListener('input', () => {
     S.filter = filter.value;
     clr.hidden = !S.filter;
     clearTimeout(filterTimer);
-    filterTimer = setTimeout(() => { S.cursor = 0; S.sel = new Set(); S.anchor = 0; S.shown = derive(); fillList(); updateFoot(); }, S.report.folders.length > 20000 ? 150 : 0);
+    const report = S.report;
+    applyPendingFilter = () => {
+      if (S.report !== report || S.view !== 'results' || busy()) return;
+      list.inert = false;
+      S.cursor = 0; S.sel = new Set(); S.anchor = 0; S.shown = derive(); fillList(); updateFoot();
+    };
+    list.inert = true;
+    filterTimer = setTimeout(settleFilter, S.report.folders.length > 20000 ? 150 : 0);
   });
-  filter.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); $('#list').focus(); } });
+  filter.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); settleFilter(); $('#list').focus(); } });
   const list = h('div', { class: 'list', id: 'list', tabindex: '0', role: 'listbox', 'aria-multiselectable': 'true', 'aria-label': 'Empty folders' });
   list.addEventListener('scroll', drawRows);
   list.addEventListener('keydown', listKey);
@@ -419,14 +496,17 @@ function viewResults(m) {
     if (f) revealFolder(f.path, true);
   });
   const quick = (id, text, tip, fn) => h('button', { class: 'btn sm', type: 'button', id, text, title: tip, onClick: fn });
+  const withFilter = (fn) => () => { settleFilter(); fn(); };
 
   m.append(
     h('div', { class: 'rhead' },
       h('div', { class: 'title' }, `Found ${S.report.folders.length.toLocaleString()} empty folders under `, h('span', { class: 'mono selectable', title: S.base, text: S.base })),
       h('div', { class: 'rtools' }, h('div', { class: 'inputgroup filtergroup' }, filter, clr),
-        quick('btn-all', 'All', 'Tick every row', () => checkMany(S.shown, true)),
-        quick('btn-none', 'None', 'Untick every row', () => checkMany(S.shown, false)),
-        quick('btn-invert', 'Invert', 'Swap ticked and unticked rows', invert))),
+        quick('btn-all', 'All', 'Tick every row', withFilter(() => checkMany(S.shown, true))),
+        quick('btn-none', 'None', 'Untick every row', withFilter(() => checkMany(S.shown, false))),
+        quick('btn-invert', 'Invert', 'Swap ticked and unticked rows', withFilter(invert)),
+        quick('btn-rescan', 'Rescan', 'Scan again using the same folder and options', rescan))),
+    ...(S.report.skipped.length ? [skippedStrip()] : []),
     ...(S.outcome ? [outcomeStrip()] : []), // m.append() would print a literal "null"
     list,
     h('div', { class: 'rfoot' },
@@ -447,8 +527,18 @@ function viewResults(m) {
   listWatch.observe(list);
 }
 let listWatch;
-// Folders that are not inside another folder in the results. Deleting a parent removes its empty
-// children too, so ticking only these avoids listing the same work twice.
+let filterTimer, applyPendingFilter;
+function cancelPendingFilter() {
+  clearTimeout(filterTimer);
+  applyPendingFilter = null;
+}
+function settleFilter() {
+  clearTimeout(filterTimer);
+  const apply = applyPendingFilter;
+  applyPendingFilter = null;
+  apply?.();
+}
+
 function sortBy(k) { S.sortDir = S.sortKey === k ? -S.sortDir : 1; S.sortKey = k; S.shown = derive(); S.cursor = 0; S.sel = new Set(); S.anchor = 0; updateFoot(); fillList(); }
 
 function headerEl() {
@@ -461,8 +551,15 @@ function headerEl() {
 function fillList() {
   const list = $('#list'); if (!list) return;
   list.replaceChildren();
-  if (!S.shown.length) { list.append(h('div', { class: 'zero' }, h('b', { text: S.report.folders.length ? 'Nothing matches the filter' : 'No empty folders found' }), S.report.folders.length ? '' : 'Everything under that folder contains something.')); return; }
-  const longest = S.shown.reduce((n, f) => Math.max(n, f.path.length), 0);
+  if (!S.shown.length) {
+    list.removeAttribute('aria-activedescendant');
+    list.append(h('div', { class: 'zero' }, h('b', { text: 'Nothing matches the filter' })));
+    return;
+  }
+  if (resultWidth?.folders !== S.report.folders || resultWidth.query !== S.filter) {
+    resultWidth = { folders: S.report.folders, query: S.filter, longest: S.shown.reduce((n, f) => Math.max(n, f.path.length), 0) };
+  }
+  const longest = resultWidth.longest;
   const need = Math.ceil((longest + 8) * charW) + 40 + 16 + 120 + 24;
   const canvas = h('div', { class: 'canvas', style: `min-width:${need}px` }, headerEl(), h('div', { class: 'rows', style: `height:${S.shown.length * ROW}px` }));
   list.append(canvas);
@@ -555,7 +652,7 @@ function rowEl(i) {
 function toggleRow(f) { S.checked.has(f.path) ? S.checked.delete(f.path) : S.checked.add(f.path); syncRows(); updateFoot(); }
 function checkMany(rows, on) { for (const f of rows) on ? S.checked.add(f.path) : S.checked.delete(f.path); syncRows(); updateFoot(); }
 function invert() { for (const f of S.shown) S.checked.has(f.path) ? S.checked.delete(f.path) : S.checked.add(f.path); syncRows(); updateFoot(); }
-const checkedPaths = () => (S.report ? S.report.folders.map((f) => f.path).filter((p) => S.checked.has(p)) : []);
+const checkedPaths = () => S.report ? S.report.folders.filter((f) => S.checked.has(f.path)).map((f) => f.path) : [];
 function updateFoot() {
   const n = S.checked.size, fc = $('#foot-count'), db = $('#del-btn'); // S.checked only ever holds listed paths
   for (const [id, t] of [['btn-all', 'All'], ['btn-none', 'None']]) {
@@ -605,7 +702,7 @@ async function doDeleteNow() {
   if (c.confirmDelete || inside) {
     const how = mode === 'recycle' ? 'They go to the Recycle Bin where Windows allows it.' : 'They are removed permanently and cannot be restored.';
     const nestedNote = inside ? ` ${plural(inside, 'unticked folder')} inside the ticked ones will go with them. Uncheck the parent to keep those subfolders.` : '';
-    if (!(await confirmBox(`Delete ${plural(paths.length, 'empty folder')}?`, how + nestedNote + ' Folders containing regular files are kept. Files matching enabled junk rules may go with their folder.', mode === 'recycle' ? 'Delete' : 'Delete permanently', true, mode === 'permanent'))) { $('#list')?.focus(); return; }
+    if (!(await confirmBox(`Delete ${plural(paths.length, 'empty folder')}?`, how + nestedNote + ' Folders with new files are kept. Only unchanged junk files found during the scan can go with their folder.', mode === 'recycle' ? 'Delete' : 'Delete permanently', true, mode === 'permanent'))) { $('#list')?.focus(); return; }
   }
   S.deleting = true; S.del = { done: 0, total: paths.length, path: '' };
   go('results');
@@ -637,10 +734,10 @@ async function doDeleteNow() {
     const msg = parts.join(' · ');
     const issues = [
       ...failed.map((r) => ({ path: r.path, what: 'Could not delete', why: Object.values(r.outcome)[0] })),
-      ...kept.map((r) => ({ path: r.path, what: 'Kept', why: 'No longer empty (something appeared in it since the scan)' })),
+      ...kept.map((r) => ({ path: r.path, what: 'Kept', why: 'The folder contains a new, changed, or in-use item, or could not be verified' })),
       ...prot.map((r) => ({ path: r.path, what: 'Kept', why: 'Protected location' }))];
     S.deleting = false; resetOverrides(); status(msg);
-    if (c.exitAfter && !issues.length && !stopped) { await flushSave(); call('confirm_exit'); return; }
+    if (c.exitAfter && !issues.length && !stopped && !forwardedFolders.length) { await flushSave(); call('confirm_exit'); return; }
     if (!S.report.folders.length) { // nothing left to show: back to the first screen, ready for the next search
       S.report = null; go('home'); toast(msg, 'ok'); return;
     }
@@ -661,7 +758,15 @@ function refreshShell() {
 }
 function shellItems() {
   const enabled = S.shell?.enabled;
-  return [{ label: enabled ? 'Disable context menu' : 'Enable context menu', run: () => toggleShell(enabled) }];
+  const items = [{ label: enabled ? 'Disable context menu' : 'Enable context menu', run: () => toggleShell(enabled) }];
+  if (S.shell?.refreshFailed) {
+    items.push({ label: 'Retry saved copy update', run: () => once('shell', async () => {
+      try { await call('shell_retry_refresh'); toast('Saved copy is up to date', 'ok'); }
+      catch (e) { fail(e); }
+      await refreshShell();
+    }) });
+  }
+  return items;
 }
 function toggleShell(enabled) {
   return once('shell', async () => {
@@ -684,7 +789,11 @@ function viewSettings(m) {
     frow('Results window size', 'The window cannot be dragged, so choose how big the results screen is', dropdown([{ value: 'small', label: 'Small' }, { value: 'default', label: 'Default' }, { value: 'large', label: 'Large' }], c.resultsSize, (v) => set('resultsSize', v))),
     frow('Compact mode', 'Smaller window and tighter spacing', h('div', { style: 'display:contents' }, check('', c.compact, (v) => { set('compact', v); applyTheme(); render(); }))),
     frow('Show modified date column', 'In the results list', h('div', { style: 'display:contents' }, check('', c.showModified, (v) => set('showModified', v)))),
-    frow('Reset all settings', 'Back to the defaults', h('button', { class: 'btn', type: 'button', text: 'Reset…', onClick: async () => { if (await confirmBox('Reset all settings?', 'Your options go back to the defaults.', 'Reset')) { S.cfg = structuredClone(DEFAULTS); save(); applyTheme(); render(); toast('Settings reset'); } } })),
+    frow('Allow multiple instances', 'Close all app windows and reopen the app to apply this change.', checkbox(c.allowMultipleInstances, (value) => {
+      pendingInstancePreference = value;
+      set('allowMultipleInstances', value);
+    }, 'Allow multiple instances')),
+    frow('Reset all settings', 'Back to the defaults', h('button', { class: 'btn', type: 'button', text: 'Reset…', onClick: async () => { if (await confirmBox('Reset all settings?', 'Your options go back to the defaults.', 'Reset')) { pendingInstancePreference = DEFAULTS.allowMultipleInstances; S.cfg = structuredClone(DEFAULTS); save(); applyTheme(); render(); toast('Settings reset'); } } })),
   )));
 }
 function viewAbout(m) {
@@ -694,7 +803,7 @@ function viewAbout(m) {
     h('h2', { text: 'Quick start' }),
     h('ol', { class: 'box quick-start' },
       h('li', { text: 'Browse for a base folder or drop one onto the window, then choose Find.' }),
-      h('li', { text: 'Review the checked results. Use the filter to narrow the list.' }),
+      h('li', { text: 'Filter and review the results. Use Rescan to check the same folder again, or Skipped folders to see what could not be checked.' }),
       h('li', { text: 'Send checked folders to the Recycle Bin or choose permanent deletion. Deleting a nested parent also removes its empty subfolders, including unchecked ones.' })),
     h('h2', { text: 'Explorer and help' }),
     h('div', { class: 'box' }, h('p', { text: 'Enable the context menu to scan from Explorer. Use the bug icon in the title bar to open GitHub Issues.' })),
@@ -754,11 +863,20 @@ addEventListener('click', (e) => { const a = e.target.closest && e.target.closes
 async function boot() {
   const bridge = $('#bridge');
   if (!hasBridge) { bridge.className = 'bridge bad'; bridge.lastChild.textContent = 'No backend'; main().append(h('div', { class: 'zero' }, h('b', { text: 'Backend not connected' }), 'The native bridge is missing, so nothing can run.')); return; }
-  try { S.version = await call('ping'); bridge.className = 'bridge ok'; bridge.lastChild.textContent = 'v' + S.version; }
-  catch (e) { bridge.className = 'bridge bad'; bridge.lastChild.textContent = 'Backend error'; fail(e); }
+  let startup;
+  try {
+    startup = await call('bootstrap');
+    S.version = startup.version; bridge.className = 'bridge ok'; bridge.lastChild.textContent = 'v' + S.version;
+  } catch (e) {
+    bridge.className = 'bridge bad'; bridge.lastChild.textContent = 'Backend error';
+    fail(e);
+    go('home'); clearTimeout(fitTimer); fit(false, true);
+    return;
+  }
   let migrated = false;
   try {
-    const saved = JSON.parse(await call('load_settings'));
+    if ('Err' in startup.settings) throw startup.settings.Err;
+    const saved = startup.settings.Ok;
     if (!saved.base && Array.isArray(saved.roots) && saved.roots[0]) saved.base = saved.roots[0]; // from 2.0 alpha settings
     // v3: before this version, choosing "permanent"/"dry run" on the results screen silently changed
     // the saved defaults. Put them back to the safe values once, and say so.
@@ -771,19 +889,20 @@ async function boot() {
     S.cfg = { ...structuredClone(DEFAULTS), ...saved };
     // A hand-edited or damaged file must not be able to break the app.
     // Only known keys of the right type survive (this also drops keys of removed features).
-    for (const k of Object.keys(S.cfg)) if (!(k in DEFAULTS)) delete S.cfg[k]; else if (typeof S.cfg[k] !== typeof DEFAULTS[k]) S.cfg[k] = structuredClone(DEFAULTS[k]);
+    for (const k of Object.keys(S.cfg)) if (!Object.hasOwn(DEFAULTS, k)) delete S.cfg[k]; else if (typeof S.cfg[k] !== typeof DEFAULTS[k]) S.cfg[k] = DEFAULTS[k];
     if (!['recycle', 'permanent'].includes(S.cfg.mode)) S.cfg.mode = 'recycle';
     if (!['dark', 'light'].includes(S.cfg.theme)) S.cfg.theme = 'dark';
-    if (!RESULT_SHARE[S.cfg.resultsSize]) S.cfg.resultsSize = 'default';
+    if (!Object.hasOwn(RESULT_SHARE, S.cfg.resultsSize)) S.cfg.resultsSize = 'default';
     if (typeof S.cfg.base !== 'string') S.cfg.base = '';
-  } catch { /* first run */ }
+  } catch (error) { fail(`Could not load settings: ${error}`); }
   applyTheme();
   $('#win-min').onclick = () => call('window_minimize');
   $('#report-bug').onclick = () => once('report-bug', () => call('open_bug_report').catch(fail));
   $('#win-close').onclick = async () => { await flushSave(); call('window_close'); };
   $('#open-menu').onclick = async (e) => { if (busy()) return; const b = e.currentTarget; await refreshShell(); mainMenu(b); };
-  listen('scan-progress', (p) => { const el = $('#scan-path'); if (el) el.textContent = p.path; const c = $('#scan-count'); if (c) c.textContent = `${p.count.toLocaleString()} folders read`; status(`Scanning… ${p.count.toLocaleString()} folders`); });
+  listen('scan-progress', (p) => { if (!S.scanning) return; const el = $('#scan-path'); if (el) el.textContent = p.path; const c = $('#scan-count'); if (c) c.textContent = `${p.count.toLocaleString()} folders read`; status(`Scanning… ${p.count.toLocaleString()} folders`); });
   listen('delete-progress', (p) => {
+    if (!S.deleting) return;
     S.del = { done: p.done, total: p.total, path: p.path };
     const bar = $('#del-bar'); if (bar) bar.style.width = `${(p.done / p.total) * 100}%`;
     const cnt = $('#del-count'); if (cnt) cnt.textContent = `${p.done.toLocaleString()} of ${p.total.toLocaleString()}`;
@@ -796,12 +915,15 @@ async function boot() {
   });
   onFileDrop({ over: () => { $('#drop-overlay').hidden = false; }, leave: () => { $('#drop-overlay').hidden = true; },
     drop: (paths) => { $('#drop-overlay').hidden = true; if (paths[0] && !busy() && !$('#layer .scrim')) { set('base', paths[0]); doScan(); } } }).catch(() => {});
-  refreshShell();
   go('home');
   clearTimeout(fitTimer);
   fit(false, true);
   if (migrated) { save(); toast('Delete method set back to the Recycle Bin (an older version could change it by accident)'); }
-  const launch = await call('launch_folders').catch(() => []);
+  const launch = startup.folders;
   if (launch.length) { set('base', launch[0]); doScan(); }
+  try {
+    await listen('folders-forwarded', receiveForwardedFolders);
+    await receiveForwardedFolders();
+  } catch (error) { fail(error); }
 }
 boot();

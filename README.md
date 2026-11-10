@@ -2,6 +2,12 @@
 
 A portable Windows utility for finding and removing empty folders. It scans a folder you choose, shows what it found, and lets you decide which folders to remove.
 
+## Screenshots
+
+![Empty Folder Nuker home screen with folder and scan options](docs/screenshots/home.png)
+
+![Scan results showing nested folders, selection controls, and Rescan](docs/screenshots/results.png)
+
 ## Download
 
 Download [EmptyFolderNuker.exe](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/releases/latest/download/EmptyFolderNuker.exe) from the [latest GitHub release](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/releases/latest). The release notes give the version and SHA-256.
@@ -17,13 +23,15 @@ The app runs on Windows 10 and 11 with Microsoft Edge WebView2 Runtime. Run the 
 
 **More options** controls which folders to skip, whether known junk files count as content, and your default deletion method. The app rechecks folders before removal. It keeps folders with newly discovered content or subfolders outside the last scan. You can opt in to scanning through links, but deletion leaves linked locations alone.
 
-Deleting a **nested** parent also removes its empty subfolders, including unchecked ones. The app warns before this happens. It keeps folders containing regular files. Files matched by enabled junk rules can go with their folder.
+Deleting a **nested** parent also removes its empty subfolders, including unchecked ones. The app warns before this happens. Only unchanged junk files found during the scan can go with their folder.
 
 ## Explorer right-click menu
 
 Choose **Enable context menu** from the app menu. Explorer can then run **Find empty folders** on folders, drive roots, and blank areas inside folders. On Windows 11 it appears under **Show more options**.
 
-On launch, the app keeps a copy in `%LOCALAPPDATA%\EmptyFolderNuker` whether or not the context menu is enabled. A newer download replaces the saved copy automatically, including newer builds with the same displayed version. The app compares versions first, then build timestamps within the same version. A failed refresh can retry on a later launch.
+After the window opens, the app refreshes its copy in `%LOCALAPPDATA%\EmptyFolderNuker`, even with the context menu disabled. Close the running app before opening a newer download so it can update the saved copy. The app compares versions first, then build timestamps within the same version. If the automatic refresh fails, the app menu offers a retry.
+
+By default, Explorer scan requests reuse the existing window. To open separate windows, enable **Allow multiple instances** in Settings, then close all app windows and reopen the app.
 
 **Disable context menu** removes the Explorer entry and keeps the saved copy. The portable executable also accepts `--scan <folder>`, `--enable-context-menu`, `--disable-context-menu`, `--help`, and `--version`.
 
@@ -31,7 +39,7 @@ On launch, the app keeps a copy in `%LOCALAPPDATA%\EmptyFolderNuker` whether or 
 
 GitHub Actions tests and builds the Windows executable on pull requests and on pushes to `main`. You can also run **Windows build** manually from the **Actions** tab. Download the `EmptyFolderNuker-Windows-x64` artifact from a successful run for the executable and its checksum.
 
-To publish a GitHub Release, choose **Run workflow** on `main` and enable **Publish the verified Windows build as a GitHub Release**. The release uses the executable from that run and gets its own build tag. The app version stays the same, and existing releases stay available.
+To publish a GitHub Release, choose **Run workflow** on `main` and enable **Publish the verified Windows build as a GitHub Release**. The release uses the executable from that run and gets its own build tag. The **initial release** option uses the `v1.0.0` tag and the original release notes, updated to match the build.
 
 The scanning and deletion logic lives in `core/`. The Windows app uses Tauri 2 with an embedded HTML, CSS, and JavaScript interface.
 

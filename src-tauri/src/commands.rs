@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State, Window};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 use tauri_plugin_dialog::DialogExt;
 
 #[derive(Default)]
@@ -58,15 +58,22 @@ fn quiet(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// The one deliberate round trip the UI makes on boot to prove the bridge works.
-#[tauri::command]
-pub fn ping() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+#[derive(Serialize)]
+pub struct Bootstrap {
+    version: &'static str,
+    settings: Result<serde_json::Value, String>,
+    folders: Vec<String>,
 }
 
 #[tauri::command]
-pub fn launch_folders(state: State<'_, crate::Launch>) -> Vec<String> {
-    state.0.clone()
+pub fn bootstrap(launch: State<'_, crate::Launch>, startup: State<'_, crate::Startup>) -> Bootstrap {
+    startup.mark("webview ready");
+    Bootstrap { version: env!("CARGO_PKG_VERSION"), settings: startup.settings.clone(), folders: launch.0.clone() }
+}
+
+#[tauri::command]
+pub fn take_forwarded_folders(state: State<'_, crate::ForwardedFolders>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
 }
 
 #[tauri::command]
@@ -75,11 +82,6 @@ pub async fn start_scan(
     state: State<'_, ScanState>,
     opts: ScanOptions,
 ) -> Result<ScanReport, String> {
-    for r in &opts.roots {
-        if !std::path::Path::new(r).is_dir() {
-            return Err(format!("Folder \"{r}\" does not exist"));
-        }
-    }
     if state.working.swap(true, Ordering::SeqCst) {
         return Err("Another operation is already running".into());
     }
@@ -196,18 +198,32 @@ pub fn reveal(path: String, open_inside: bool) -> Result<(), String> {
     }
 }
 
-fn exe() -> String {
-    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplorerStatus {
+    #[serde(flatten)]
+    shell: shell::ShellStatus,
+    refresh_failed: bool,
 }
 
 #[tauri::command]
-pub fn shell_status() -> shell::ShellStatus {
-    shell::status()
+pub fn shell_status(startup: State<'_, crate::Startup>) -> ExplorerStatus {
+    ExplorerStatus { shell: shell::status(), refresh_failed: startup.refresh_failed.load(Ordering::Relaxed) }
 }
 
 #[tauri::command]
-pub async fn shell_enable() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(|| shell::enable(&exe(), crate::BUILD_ID))
+pub async fn shell_enable(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let startup = app.state::<crate::Startup>();
+        shell::enable(&startup.exe, crate::BUILD_ID)?;
+        startup.refresh_failed.store(false, Ordering::Relaxed);
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn shell_retry_refresh(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<crate::Startup>().refresh_copy())
         .await.map_err(|e| e.to_string())?
 }
 
@@ -217,14 +233,8 @@ pub async fn shell_disable() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn load_settings() -> String {
-    settings::load()
-}
-
-#[tauri::command]
-pub fn store_settings(json: String) -> Result<(), String> {
-    serde_json::from_str::<serde_json::Value>(&json).map_err(|e| e.to_string())?;
-    settings::store(&json)
+pub async fn store_settings(json: String, allow_multiple: Option<bool>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || settings::store(&json, allow_multiple)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -298,6 +308,7 @@ pub fn fit_window(window: Window, anchor: State<'_, WindowAnchor>, width: f64, h
     if show == Some(true) && !window.is_visible().map_err(|e| e.to_string())? {
         window.show().map_err(|e| e.to_string())?;
         let _ = window.set_focus();
+        window.state::<crate::Startup>().window_shown(window.app_handle().clone());
     }
     Ok(())
 }

@@ -116,8 +116,34 @@ fn cancel_stops_and_flags() {
 
 #[test]
 fn bad_root_is_reported_not_fatal() {
-    let o = ScanOptions { roots: vec!["/definitely/not/here".into()], ..Default::default() };
-    assert_eq!(run(&o).skipped.len(), 1);
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("file.txt");
+    fs::write(&file, "").unwrap();
+    let missing = dir.path().join("missing");
+    let o = ScanOptions { roots: vec![missing.to_string_lossy().into(), file.to_string_lossy().into()], ..Default::default() };
+    let r = run(&o);
+    assert_eq!(r.scanned, 0);
+    assert_eq!(r.skipped[0].reason, "Folder does not exist");
+    assert_eq!(r.skipped[1].reason, "This path is not a folder");
+}
+
+#[test]
+fn child_that_disappears_during_scan_is_reported_in_both_modes() {
+    for recurse in [false, true] {
+        let dir = tempdir().unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let o = ScanOptions { recurse, include_root: true, ..opts(dir.path()) };
+        let r = scan(&o, &AtomicBool::new(false), &mut |path, _| {
+            if path == child {
+                fs::remove_dir(path).unwrap();
+            }
+        });
+        assert!(r.folders.is_empty());
+        assert_eq!(r.skipped.len(), 1);
+        assert_eq!(r.skipped[0].path, child.to_string_lossy());
+        assert!(r.skipped[0].reason.starts_with("Could not read folder"));
+    }
 }
 
 #[test]
@@ -126,6 +152,19 @@ fn wildcard_matching() {
     assert!(scan::wildcard("node_*", "node_modules"));
     assert!(scan::wildcard("t?mp", "temp"));
     assert!(!scan::wildcard("*.tmp", "a.tmpx"));
+}
+
+#[test]
+fn compiled_name_rules_match_the_reference() {
+    let patterns = ["Thumbs.DB", "Straße.*", "İ?.tXt", "*.TEMP", "a**b*", "*.*", "?"]
+        .map(String::from);
+    for junk in [true, false] {
+        let rules = scan::NameRules::compile(&patterns, junk);
+        for name in ["thumbs.db", "DESKTOP.INI", "STRaße.csv", "İa.TXT", "x.temp", "aab", "a", "a.txt", "İé.txt", ""] {
+            let expected = patterns.iter().any(|p| (!junk || scan::valid_junk_pattern(p)) && scan::wildcard(p, name));
+            assert_eq!(rules.matches(name), expected, "{name:?} (junk: {junk})");
+        }
+    }
 }
 
 #[test]
@@ -479,6 +518,96 @@ fn the_delete_policy_only_accepts_folders_from_the_last_scan_with_that_scans_rul
     assert!(matches!(get(&other), DeleteOutcome::Failed(_)), "{:?}", get(&other));
     assert_eq!(get(&scanned), DeleteOutcome::NotEmpty);
     assert!(d.path().join("scanned/desktop.ini").exists() && d.path().join("other").exists());
+}
+
+#[test]
+fn files_started_after_scan_keep_their_parent_in_both_delete_modes() {
+    use std::io::Write;
+    for mode in [DeleteMode::Permanent, DeleteMode::Recycle] {
+        for recurse in [false, true] {
+            for name in ["copy-in-progress.iso", "copy-in-progress.tmp"] {
+                let d = tempdir().unwrap();
+                let parent = d.path().join("parent");
+                let destination = if recurse { parent.join("nested") } else { parent.clone() };
+                fs::create_dir_all(&destination).unwrap();
+                let mut options = opts(d.path());
+                options.recurse = recurse;
+                options.ignore_junk = true;
+                options.junk_patterns = vec!["*.tmp".into()];
+                let report = run(&options);
+                let target = parent.to_string_lossy().into_owned();
+                assert!(report.folders.iter().any(|row| row.path == target));
+                let policy = DeletePolicy::from_scan(&report, &options);
+                let path = destination.join(name);
+                let mut copying = fs::File::create(&path).unwrap();
+                for bytes in [&b""[..], &b"part one"[..]] {
+                    copying.write_all(bytes).unwrap();
+                    let results = policy.run(std::slice::from_ref(&target), mode, &AtomicBool::new(false), &mut |_| {});
+                    assert_eq!(results[0].outcome, DeleteOutcome::NotEmpty, "{mode:?} {name} {bytes:?}");
+                    assert!(parent.is_dir());
+                    assert_eq!(fs::read(&path).unwrap(), bytes);
+                }
+                #[cfg(windows)]
+                assert!(run(&options).folders.is_empty(), "a rescan must also keep the active copy");
+                copying.write_all(b" and part two").unwrap();
+                drop(copying);
+                assert_eq!(fs::read(path).unwrap(), b"part one and part two");
+            }
+        }
+    }
+}
+
+#[test]
+fn only_unchanged_junk_seen_in_the_scan_can_be_removed() {
+    let d = tempdir().unwrap();
+    let unchanged = d.path().join("unchanged");
+    let edited = d.path().join("edited");
+    let replaced = d.path().join("replaced");
+    for dir in [&unchanged, &edited, &replaced] {
+        fs::create_dir(dir).unwrap();
+        fs::write(dir.join("desktop.ini"), "original").unwrap();
+    }
+    let mut options = opts(d.path());
+    options.ignore_junk = true;
+    let report = run(&options);
+    assert_eq!(report.folders.len(), 3);
+    let policy = DeletePolicy::from_scan(&report, &options);
+    fs::write(edited.join("desktop.ini"), "new contents").unwrap();
+    let moved = d.path().join("download");
+    fs::write(&moved, "moved in").unwrap();
+    fs::rename(moved, replaced.join("desktop.ini")).unwrap();
+    for mode in [DeleteMode::Permanent, DeleteMode::Recycle] {
+        for (dir, expected) in [(&edited, "new contents"), (&replaced, "moved in")] {
+            let results = policy.run(&[dir.to_string_lossy().into_owned()], mode, &AtomicBool::new(false), &mut |_| {});
+            assert_eq!(results[0].outcome, DeleteOutcome::NotEmpty);
+            assert_eq!(fs::read_to_string(dir.join("desktop.ini")).unwrap(), expected);
+        }
+    }
+    let results = policy.run(&[unchanged.to_string_lossy().into_owned()], DeleteMode::Permanent, &AtomicBool::new(false), &mut |_| {});
+    assert_eq!(results[0].outcome, DeleteOutcome::Deleted);
+    assert!(!unchanged.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn opening_a_scanned_junk_file_for_writing_blocks_deletion_before_any_bytes_change() {
+    let d = tempdir().unwrap();
+    let dir = d.path().join("parent");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("desktop.ini");
+    fs::write(&path, "original").unwrap();
+    let mut options = opts(d.path());
+    options.ignore_junk = true;
+    let report = run(&options);
+    assert_eq!(report.folders.len(), 1);
+    let policy = DeletePolicy::from_scan(&report, &options);
+    let writing = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    for mode in [DeleteMode::Permanent, DeleteMode::Recycle] {
+        let results = policy.run(&[dir.to_string_lossy().into_owned()], mode, &AtomicBool::new(false), &mut |_| {});
+        assert_eq!(results[0].outcome, DeleteOutcome::NotEmpty);
+    }
+    drop(writing);
+    assert_eq!(fs::read_to_string(path).unwrap(), "original");
 }
 
 #[test]

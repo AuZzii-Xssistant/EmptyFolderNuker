@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,8 +73,65 @@ pub struct EmptyFolder {
 pub struct ScanReport {
     pub folders: Vec<EmptyFolder>,
     pub scanned: u64,
-    pub skipped: Vec<String>,
+    pub skipped: Vec<SkippedFolder>,
     pub cancelled: bool,
+    #[serde(skip)]
+    pub(crate) junk_files: HashMap<PathBuf, JunkStamp>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SkippedFolder {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JunkStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    #[cfg(any(windows, unix))]
+    identity: (u64, u64),
+}
+
+impl JunkStamp {
+    pub(crate) fn read(path: &Path) -> Option<Self> {
+        #[cfg(windows)]
+        let (meta, identity) = {
+            use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_SHARE_DELETE, FILE_SHARE_READ,
+            };
+            // An active writer makes this open fail, even if its size and timestamps are stale.
+            let file = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path).ok()?;
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: the file owns the valid handle and info is writable for the call.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return None;
+            }
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            (file.metadata().ok()?, (u64::from(info.dwVolumeSerialNumber), index))
+        };
+        #[cfg(not(windows))]
+        let meta = fs::symlink_metadata(path).ok()?;
+        if !meta.is_file() || is_link(&meta) {
+            return None;
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            created: meta.created().ok(),
+            #[cfg(any(windows, unix))]
+            identity,
+        })
+    }
 }
 
 /// A junk pattern must contain at least three literal characters. Patterns such as `*`, `*.*` or `?`
@@ -83,10 +140,53 @@ pub fn valid_junk_pattern(p: &str) -> bool {
     p.chars().filter(|c| !matches!(c, '*' | '?')).count() >= 3
 }
 
-/// Wildcard match on a single name; `*` matches any run, case-insensitive.
+/// Wildcard match on a single name; `*` matches any run, `?` one character, case-insensitive.
 pub fn wildcard(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
     let n: Vec<char> = name.to_lowercase().chars().collect();
+    match_chars(&p, &n)
+}
+
+#[derive(Default)]
+pub(crate) struct NameRules {
+    exact: HashSet<String>,
+    wild: Vec<Vec<char>>,
+}
+
+impl NameRules {
+    pub(crate) fn compile(patterns: &[String], junk: bool) -> Self {
+        let mut rules = Self::default();
+        for pattern in patterns {
+            if junk && !valid_junk_pattern(pattern) {
+                continue;
+            }
+            let lower = pattern.to_lowercase();
+            if lower.contains(['*', '?']) {
+                rules.wild.push(lower.chars().collect());
+            } else {
+                rules.exact.insert(lower);
+            }
+        }
+        rules
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        if self.exact.is_empty() && self.wild.is_empty() {
+            return false;
+        }
+        let lower = name.to_lowercase();
+        if self.exact.contains(&lower) {
+            return true;
+        }
+        if self.wild.is_empty() {
+            return false;
+        }
+        let chars: Vec<_> = lower.chars().collect();
+        self.wild.iter().any(|pattern| match_chars(pattern, &chars))
+    }
+}
+
+fn match_chars(p: &[char], n: &[char]) -> bool {
     let (mut pi, mut ni, mut star, mut mark) = (0, 0, None, 0);
     while ni < n.len() {
         if pi < p.len() && p[pi] == '*' {
@@ -112,12 +212,56 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
 
 struct Ctx<'a> {
     opts: &'a ScanOptions,
+    junk: NameRules,
+    excludes: NameRules,
     cancel: &'a AtomicBool,
     on_progress: &'a mut dyn FnMut(&Path, u64),
     report: ScanReport,
     cutoff: Option<SystemTime>,
     /// Canonical paths of followed links already entered (loop and duplicate guard).
     visited: HashSet<PathBuf>,
+}
+
+impl Ctx<'_> {
+    fn skipped(&mut self, path: &Path, reason: impl Into<String>) {
+        self.report.skipped.push(SkippedFolder { path: path.to_string_lossy().into_owned(), reason: reason.into() });
+    }
+
+    fn read_dir(&mut self, dir: &Path) -> Option<fs::ReadDir> {
+        match fs::read_dir(dir) {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                self.skipped(dir, format!("Could not read folder: {error}"));
+                None
+            }
+        }
+    }
+
+    fn entry(&mut self, dir: &Path, entry: std::io::Result<fs::DirEntry>) -> Option<(fs::DirEntry, fs::FileType)> {
+        let info = entry.and_then(|entry| Ok((entry.file_type()?, entry)));
+        match info {
+            Ok((kind, entry)) => Some((entry, kind)),
+            Err(error) => {
+                self.skipped(dir, format!("Could not read a directory entry: {error}"));
+                None
+            }
+        }
+    }
+
+    fn first_visit(&mut self, dir: &Path) -> bool {
+        if self.opts.skip_reparse {
+            return true;
+        }
+        match fs::canonicalize(dir) {
+            Ok(canon) => {
+                !(self.opts.skip_protected && crate::protect::is_protected(&canon)) && self.visited.insert(canon)
+            }
+            Err(error) => {
+                self.skipped(dir, format!("Could not resolve folder: {error}"));
+                false
+            }
+        }
+    }
 }
 
 /// Scan. `on_progress` receives the folder being read and the running count.
@@ -128,25 +272,40 @@ pub fn scan(
 ) -> ScanReport {
     let cutoff = (opts.min_age_days > 0)
         .then(|| SystemTime::now() - Duration::from_secs(opts.min_age_days as u64 * 86_400));
-    let mut ctx = Ctx { opts, cancel, on_progress, report: ScanReport::default(), cutoff, visited: HashSet::new() };
+    let junk = if opts.ignore_junk { NameRules::compile(&opts.junk_patterns, true) } else { NameRules::default() };
+    let excludes = NameRules::compile(&opts.exclude_patterns, false);
+    let mut ctx = Ctx { opts, junk, excludes, cancel, on_progress, report: ScanReport::default(), cutoff, visited: HashSet::new() };
     for root in &opts.roots {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let root = PathBuf::from(root);
-        if !root.is_dir() {
-            ctx.report.skipped.push(format!("{} (not a folder)", root.display()));
-            continue;
+        match fs::metadata(&root) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                ctx.skipped(&root, "This path is not a folder");
+                continue;
+            }
+            Err(e) => {
+                use std::io::ErrorKind;
+                let reason = match e.kind() {
+                    ErrorKind::NotFound => "Folder does not exist".into(),
+                    ErrorKind::PermissionDenied => format!("Access denied: {e}"),
+                    _ => format!("Could not open folder: {e}"),
+                };
+                ctx.skipped(&root, reason);
+                continue;
+            }
         }
         // Windows treats `/` and `\\` alike; keep one spelling so paths we report are consistent.
         #[cfg(windows)]
         let root = PathBuf::from(root.to_string_lossy().replace('/', "\\"));
         if opts.skip_reparse && has_link_ancestor(&root) {
-            ctx.report.skipped.push(format!("{} (junction or symbolic link)", root.display()));
+            ctx.skipped(&root, "Junction or symbolic link");
             continue;
         }
         if opts.skip_protected && crate::protect::is_protected_resolved(&root) {
-            ctx.report.skipped.push(format!("{} (protected location: turn off \"Skip protected locations\" to scan it)", root.display()));
+            ctx.skipped(&root, "Protected location. Turn off \"Skip protected locations\" to scan it.");
             continue;
         }
         visit(&mut ctx, &root, 0, true);
@@ -201,34 +360,22 @@ fn visit(ctx: &mut Ctx, dir: &Path, depth: u32, is_root: bool) -> Option<bool> {
     if ctx.cancel.load(Ordering::Relaxed) {
         return None;
     }
-    if !ctx.opts.skip_reparse {
-        let canon = fs::canonicalize(dir).ok()?;
-        if (ctx.opts.skip_protected && crate::protect::is_protected(&canon)) || !ctx.visited.insert(canon) {
-            return None;
-        }
+    if !ctx.first_visit(dir) {
+        return None;
     }
     tick(ctx, dir);
 
-    let rd = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(e) => {
-            ctx.report.skipped.push(format!("{} ({e})", dir.display()));
-            return None; // unreadable: never assume empty
-        }
-    };
+    let rd = ctx.read_dir(dir)?;
 
     let mut has_content = false;
     let mut had_empty_children = false;
+    let mut junk_files = Vec::new();
     for entry in rd {
         if ctx.cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let Ok(entry) = entry else {
+        let Some((entry, ft)) = ctx.entry(dir, entry) else {
             has_content = true; // an entry we could not read might be anything
-            continue;
-        };
-        let Ok(ft) = entry.file_type() else {
-            has_content = true;
             continue;
         };
         if has_content && !ft.is_dir() && !ft.is_symlink() {
@@ -242,8 +389,11 @@ fn visit(ctx: &mut Ctx, dir: &Path, depth: u32, is_root: bool) -> Option<bool> {
         let is_dir = ft.is_dir() || (ft.is_symlink() && path.is_dir());
 
         if !is_dir {
-            if ft.is_file() && !link && is_junk(ctx.opts, &os_name.to_string_lossy()) {
-                continue;
+            if ft.is_file() && !link && ctx.junk.matches(&os_name.to_string_lossy()) {
+                if let Some(stamp) = JunkStamp::read(&path) {
+                    junk_files.push((path, stamp));
+                    continue;
+                }
             }
             has_content = true;
             continue;
@@ -263,7 +413,7 @@ fn visit(ctx: &mut Ctx, dir: &Path, depth: u32, is_root: bool) -> Option<bool> {
             has_content = true;
             continue;
         }
-        let excluded = ctx.opts.exclude_patterns.iter().any(|p| wildcard(p, &name));
+        let excluded = ctx.excludes.matches(&name);
         let too_deep = ctx.opts.max_depth > 0 && depth + 1 > ctx.opts.max_depth;
         if excluded || too_deep {
             has_content = true; // not examined, so it must be assumed to hold something
@@ -271,10 +421,8 @@ fn visit(ctx: &mut Ctx, dir: &Path, depth: u32, is_root: bool) -> Option<bool> {
         }
         let child = if ctx.opts.recurse {
             visit(ctx, &path, depth + 1, false)
-        } else if leaf_empty(ctx, &path) {
-            push(ctx, &path, true, depth + 1).then_some(true)
         } else {
-            None
+            leaf_junk(ctx, &path).and_then(|junk| push(ctx, &path, true, depth + 1, junk).then_some(true))
         };
         match child {
             Some(_) => had_empty_children = true,
@@ -291,11 +439,7 @@ fn visit(ctx: &mut Ctx, dir: &Path, depth: u32, is_root: bool) -> Option<bool> {
     if is_root && !ctx.opts.include_root {
         return Some(direct);
     }
-    push(ctx, dir, direct, depth).then_some(direct)
-}
-
-fn is_junk(opts: &ScanOptions, name: &str) -> bool {
-    opts.ignore_junk && opts.junk_patterns.iter().any(|p| valid_junk_pattern(p) && wildcard(p, name))
+    push(ctx, dir, direct, depth, junk_files).then_some(direct)
 }
 
 fn tick(ctx: &mut Ctx, dir: &Path) {
@@ -305,30 +449,30 @@ fn tick(ctx: &mut Ctx, dir: &Path) {
 }
 
 /// Non-recursive mode: a direct child is empty only if it holds nothing but junk files.
-fn leaf_empty(ctx: &mut Ctx, dir: &Path) -> bool {
-    if !ctx.opts.skip_reparse {
-        let Ok(canon) = fs::canonicalize(dir) else { return false };
-        if (ctx.opts.skip_protected && crate::protect::is_protected(&canon)) || !ctx.visited.insert(canon) {
-            return false;
-        }
+fn leaf_junk(ctx: &mut Ctx, dir: &Path) -> Option<Vec<(PathBuf, JunkStamp)>> {
+    if !ctx.first_visit(dir) {
+        return None;
     }
     tick(ctx, dir);
-    let Ok(rd) = fs::read_dir(dir) else { return false };
+    let rd = ctx.read_dir(dir)?;
+    let mut junk_files = Vec::new();
     for e in rd {
         if ctx.cancel.load(Ordering::Relaxed) {
-            return false;
+            return None;
         }
-        let Ok(e) = e else { return false };
-        let is_file = e.file_type().is_ok_and(|t| t.is_file()) && !is_reparse(&e);
-        if !(is_file && is_junk(ctx.opts, &e.file_name().to_string_lossy())) {
-            return false;
+        let (e, kind) = ctx.entry(dir, e)?;
+        if !(kind.is_file() && !is_reparse(&e) && ctx.junk.matches(&e.file_name().to_string_lossy())) {
+            return None;
         }
+        let path = e.path();
+        let stamp = JunkStamp::read(&path)?;
+        junk_files.push((path, stamp));
     }
-    true
+    Some(junk_files)
 }
 
 /// Records the folder unless it is too recent. Returns whether it was recorded.
-fn push(ctx: &mut Ctx, dir: &Path, direct: bool, depth: u32) -> bool {
+fn push(ctx: &mut Ctx, dir: &Path, direct: bool, depth: u32, junk: Vec<(PathBuf, JunkStamp)>) -> bool {
     let modified = fs::metadata(dir).and_then(|m| m.modified()).ok();
     if let (Some(cut), Some(m)) = (ctx.cutoff, modified) {
         if m > cut {
@@ -344,5 +488,6 @@ fn push(ctx: &mut Ctx, dir: &Path, direct: bool, depth: u32) -> bool {
         depth,
         modified: secs,
     });
+    ctx.report.junk_files.extend(junk);
     true
 }

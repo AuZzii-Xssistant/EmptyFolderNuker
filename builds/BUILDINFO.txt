@@ -1,6 +1,0 @@
-EmptyFolderNuker.exe
-version : 1.0.0
-built   : 2026-11-10T18:48Z
-source  : source files in this commit
-size    : 3747328 bytes
-sha256  : e49fd6cc5ddcc97abbf44a44773ed61bbe89ea1f4db7db3b608df5760c78182f

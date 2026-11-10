@@ -190,18 +190,19 @@ mod imp {
     }
 
     /// Keep the saved copy current independently of the Explorer setting.
-    pub fn refresh(current: &str, build: &str) {
-        let Some(dest) = saved_path() else { return };
-        let Ok(_lock) = lock(dest.parent().unwrap()) else { return };
-        if refresh_copy(current, build, &dest).is_err() && !dest.is_file() { return; }
+    pub fn refresh(current: &str, build: &str) -> Result<(), String> {
+        let dest = saved_path().ok_or("LOCALAPPDATA is not set")?;
+        let _lock = lock(dest.parent().unwrap())?;
+        refresh_copy(current, build, &dest)?;
         let commands = registered_commands();
         if commands.iter().any(Option::is_some)
             && !commands.iter().zip(TARGETS).all(|(command, (_, arg))| {
                 command.as_deref() == Some(command_line(&dest.to_string_lossy(), arg).as_str())
             })
         {
-            let _ = register(&dest);
+            register(&dest)?;
         }
+        Ok(())
     }
 
     #[test]
@@ -230,7 +231,7 @@ mod imp {
     pub fn enable(_: &str, _: &str) -> Result<(), String> { Err(NA.into()) }
     pub fn disable() -> Result<(), String> { Err(NA.into()) }
     pub fn status() -> ShellStatus { ShellStatus::default() }
-    pub fn refresh(_: &str, _: &str) {}
+    pub fn refresh(_: &str, _: &str) -> Result<(), String> { Ok(()) }
 }
 
 pub use imp::{disable, enable, refresh, status};

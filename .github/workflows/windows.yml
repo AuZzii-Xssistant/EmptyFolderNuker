@@ -10,6 +10,10 @@ on:
         description: Publish the verified Windows build as a GitHub Release
         type: boolean
         default: false
+      initial_release:
+        description: Use the version tag and initial release notes
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,6 +56,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7.0.1
+        if: inputs.initial_release
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8.0.2
         with:
           name: EmptyFolderNuker-Windows-x64
@@ -61,6 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          INITIAL_RELEASE: ${{ inputs.initial_release }}
         run: |
           info=release/BUILDINFO.txt
           version=$(tr -d '\r' < "$info" | awk '/^version / {print $3}')
@@ -70,6 +79,17 @@ jobs:
           grep -Eq "^commit[[:space:]]*:[[:space:]]*${GITHUB_SHA:0:7}[[:xdigit:]]*([[:space:]]|$)" "$info"
 
           build="$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+          if [[ "$INITIAL_RELEASE" == true ]]; then
+            [[ "$version" == 1.0.0 ]]
+            sed "s/@SHA256@/$actual/g" docs/initial-release.md > release-notes.md
+            printf '\n\n[Build and test results](%s/%s/actions/runs/%s)\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> release-notes.md
+            gh release create "v$version" release/EmptyFolderNuker.exe "$info" \
+              --target "$GITHUB_SHA" --title "EmptyFolderNuker v$version" \
+              --latest --notes-file release-notes.md
+            exit 0
+          fi
+
           tag="v$version-build.$build"
           printf 'Portable Windows x64 build of Empty Folder Nuker %s.\n\nSHA-256: `%s`\n\n[Build and test results](%s/%s/actions/runs/%s)\n' \
             "$version" "$actual" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > release-notes.md

@@ -21,16 +21,22 @@
     core: { invoke: async (cmd, args) => {
       calls.push([cmd, args]);
       switch (cmd) {
-        case 'ping': return '1.0.0';
-        case 'fit_window': if (window.__failFits > 0) { window.__failFits--; throw 'window is minimized'; } if (window.__dropFits > 0) { window.__dropFits--; return null; } if (window.__resize) window.__resize(args.width, args.height); return null;
-        case 'launch_folders': return [];
-        case 'load_settings': return settings;
+        case 'bootstrap': return { version: '1.0.0', settings: { Ok: JSON.parse(settings) }, folders: [] };
+        case 'take_forwarded_folders': return (window.__forwardedFolders || []).splice(0);
+        case 'fit_window': if (window.__failFits > 0) { window.__failFits--; throw 'window is minimized'; } if (window.__dropFits > 0) { window.__dropFits--; return null; } if (window.__resize) await window.__resize(args.width, args.height); return null;
         case 'store_settings': settings = args.json; return;
-        case 'shell_status': return { supported: true, enabled: shellEnabled };
+        case 'shell_status': return { supported: true, enabled: shellEnabled, refreshFailed: !!window.__refreshFailed };
         case 'shell_enable': shellEnabled = true; return null;
         case 'shell_disable': shellEnabled = false; return null;
+        case 'shell_retry_refresh': window.__refreshFailed = false; return null;
         case 'start_scan':
-          if (args.opts.roots[0] === 'C:\\Nope') throw 'Folder "C:\\Nope" does not exist';
+          if (args.opts.roots[0] === 'C:\\Nope') return { folders: [], scanned: 0, skipped: [{ path: 'C:\\Nope', reason: 'Folder does not exist' }], cancelled: false };
+          if (args.opts.roots[0] === 'C:\\Partial') return { folders: [], scanned: 1, skipped: [{ path: 'C:\\Partial\\locked', reason: 'Access denied' }], cancelled: false };
+          if (args.opts.roots[0] === 'C:\\Cancelled') return { folders: [], scanned: 9, skipped: [], cancelled: true };
+          if (args.opts.roots[0] === 'C:\\Large') {
+            const extra = Array.from({ length: 15000 }, (_, i) => ({ path: `C:\\Data\\large\\f${i}`, direct: true, depth: 2, modified: 1700000000 }));
+            return { folders: [...folders, ...extra], scanned: 20007, skipped: [{ path: 'C:\\Large\\locked', reason: 'Access denied' }], cancelled: false };
+          }
           if (args.opts.roots[0] === 'C:\\Empty') return { folders: [], scanned: 12, skipped: [], cancelled: false };
           await new Promise((r) => setTimeout(r, 1200)); return { folders, scanned: 9000, skipped: [], cancelled: false };
         case 'delete_paths': {
