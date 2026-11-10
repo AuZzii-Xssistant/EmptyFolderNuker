@@ -304,7 +304,7 @@ pub fn fit_window(window: Window, anchor: State<'_, WindowAnchor>, width: f64, h
 
 #[tauri::command]
 pub fn open_bug_report() -> Result<(), String> {
-    const URL: &str = "https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/new?template=bug_report.yml";
+    const URL: &str = "https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/";
     #[cfg(windows)]
     {
         use std::ffi::c_void;

@@ -426,8 +426,7 @@ function viewResults(m) {
       h('div', { class: 'rtools' }, h('div', { class: 'inputgroup filtergroup' }, filter, clr),
         quick('btn-all', 'All', 'Tick every row', () => checkMany(S.shown, true)),
         quick('btn-none', 'None', 'Untick every row', () => checkMany(S.shown, false)),
-        quick('btn-invert', 'Invert', 'Swap ticked and unticked rows', invert),
-        quick('btn-top', 'Top-most only', 'Tick only folders that are not inside another listed folder (deleting a parent removes its empty children too)', topMostOnly))),
+        quick('btn-invert', 'Invert', 'Swap ticked and unticked rows', invert))),
     ...(S.outcome ? [outcomeStrip()] : []), // m.append() would print a literal "null"
     list,
     h('div', { class: 'rfoot' },
@@ -450,22 +449,6 @@ function viewResults(m) {
 let listWatch;
 // Folders that are not inside another folder in the results. Deleting a parent removes its empty
 // children too, so ticking only these avoids listing the same work twice.
-function topMostSet() {
-  const all = new Set(S.report.folders.map((f) => f.lp));
-  const top = new Set();
-  for (const f of S.report.folders) {
-    const p = f.lp, sep = p.includes('\\') ? '\\' : '/';
-    let cut = p.lastIndexOf(sep), isTop = true;
-    while (cut > 0) { if (all.has(p.slice(0, cut))) { isTop = false; break; } cut = p.lastIndexOf(sep, cut - 1); }
-    if (isTop) top.add(f.path);
-  }
-  return top;
-}
-function topMostOnly() {
-  const top = topMostSet();
-  for (const f of S.shown) top.has(f.path) ? S.checked.add(f.path) : S.checked.delete(f.path);
-  syncRows(); updateFoot();
-}
 function sortBy(k) { S.sortDir = S.sortKey === k ? -S.sortDir : 1; S.sortKey = k; S.shown = derive(); S.cursor = 0; S.sel = new Set(); S.anchor = 0; updateFoot(); fillList(); }
 
 function headerEl() {
@@ -545,7 +528,7 @@ function rowEl(i) {
   };
   const row = h('div', { class: 'item' + (i === S.cursor ? ' cursor' : '') + (S.sel.has(f.path) ? ' sel' : ''), style: `top:${i * ROW}px`, dataset: { i }, id: 'row-' + i, role: 'option', 'aria-selected': String(S.sel.has(f.path) || i === S.cursor && S.sel.size === 0) },
     h('div', { class: 'cell-chk' }, checkbox(S.checked.has(f.path), onCheck, 'Check ' + f.path)),
-    h('div', { class: 'cell-path', title: f.path }, f.path, f.direct ? null : h('span', { class: 'tag', title: 'Only contains other empty folders', text: 'nested' })),
+    h('div', { class: 'cell-path', title: f.path }, f.path, f.direct ? null : h('span', { class: 'tag', title: 'Deleting this parent also removes its empty subfolders', text: 'nested' })),
     h('div', { class: 'cell-meta' + (S.cfg.showModified ? '' : ' nomod'), title: f.modified ? 'Last modified ' + new Date(f.modified * 1000).toLocaleString() : '' }, S.cfg.showModified ? fmtDate(f.modified) : null));
   row.addEventListener('mousedown', (e) => { if (e.button !== 0 || e.target.closest('.chk')) return; e.preventDefault(); clickRow(i, e); });
   row.addEventListener('contextmenu', (e) => {
@@ -564,14 +547,11 @@ function rowEl(i) {
       { label: S.checked.has(f.path) ? 'Uncheck' : 'Check', hint: 'Space', run: () => toggleRow(f) }, '-',
       { label: 'Open folder', run: () => revealFolder(f.path, true) },
       { label: 'Show in Explorer', run: () => revealFolder(f.path, false) },
-      { label: 'Copy path', run: () => copyText(f.path).then(() => toast('Path copied')) }, '-',
-      { label: 'Check everything under this folder', run: () => checkMany(S.shown.filter((s) => isUnder(s.lp, f.lp)), true) },
+      { label: 'Copy path', run: () => copyText(f.path).then(() => toast('Path copied')) },
     ], e.clientX, e.clientY);
   });
   return row;
 }
-// `child` is `parent` or inside it (a whole path component, not just a shared prefix: foo vs foobar).
-const isUnder = (child, parent) => { const p = parent.replace(/[\\/]+$/, ''); return child === p || child.startsWith(p + '\\') || child.startsWith(p + '/'); };
 function toggleRow(f) { S.checked.has(f.path) ? S.checked.delete(f.path) : S.checked.add(f.path); syncRows(); updateFoot(); }
 function checkMany(rows, on) { for (const f of rows) on ? S.checked.add(f.path) : S.checked.delete(f.path); syncRows(); updateFoot(); }
 function invert() { for (const f of S.shown) S.checked.has(f.path) ? S.checked.delete(f.path) : S.checked.add(f.path); syncRows(); updateFoot(); }
@@ -607,26 +587,25 @@ async function savePathsNow() {
   if (!paths.length) { toast('Nothing is checked', 'bad'); return; }
   try { const where = await call('save_paths', { lines: paths }); if (where) { toast('Saved ' + plural(paths.length, 'path'), 'ok'); } } catch (e) { fail(e); }
 }
-// Unticked folders that sit inside a ticked folder: deleting the parent removes them too.
-function nestedUnticked() {
-  const ticked = new Set(S.report.folders.filter((f) => S.checked.has(f.path)).map((f) => f.lp));
-  let n = 0;
-  for (const f of S.report.folders) {
-    if (S.checked.has(f.path)) continue;
-    const p = f.lp, sep = p.includes('\\') ? '\\' : '/';
-    for (let cut = p.lastIndexOf(sep); cut > 0; cut = p.lastIndexOf(sep, cut - 1)) if (ticked.has(p.slice(0, cut))) { n++; break; }
+const pathKey = (path) => path.replaceAll('\\', '/').replace(/\/+$/, '');
+function hasAncestor(path, parents) {
+  if (!parents.size) return false;
+  for (let cut = path.lastIndexOf('/'); cut > 0; cut = path.lastIndexOf('/', cut - 1)) {
+    if (parents.has(path.slice(0, cut))) return true;
   }
-  return n;
+  return false;
 }
 async function doDelete() { return once('delete', doDeleteNow); }
 async function doDeleteNow() {
   const paths = checkedPaths(), c = S.cfg, mode = curMode();
   if (!paths.length || S.deleting || S.scanning) return;
-  if (c.confirmDelete) {
+  const checked = new Set(paths.map(pathKey));
+  const inside = S.report.folders.reduce((count, f) =>
+    count + Number(!S.checked.has(f.path) && hasAncestor(pathKey(f.path), checked)), 0);
+  if (c.confirmDelete || inside) {
     const how = mode === 'recycle' ? 'They go to the Recycle Bin where Windows allows it.' : 'They are removed permanently and cannot be restored.';
-    const inside = nestedUnticked();
-    const nestedNote = inside ? ` ${plural(inside, 'unticked folder')} inside the ticked ones will go with them.` : '';
-    if (!(await confirmBox(`Delete ${plural(paths.length, 'empty folder')}?`, how + nestedNote + ' Folders that gained files since the scan are skipped.', mode === 'recycle' ? 'Delete' : 'Delete permanently', true, mode === 'permanent'))) { $('#list')?.focus(); return; }
+    const nestedNote = inside ? ` ${plural(inside, 'unticked folder')} inside the ticked ones will go with them. Uncheck the parent to keep those subfolders.` : '';
+    if (!(await confirmBox(`Delete ${plural(paths.length, 'empty folder')}?`, how + nestedNote + ' Folders containing regular files are kept. Files matching enabled junk rules may go with their folder.', mode === 'recycle' ? 'Delete' : 'Delete permanently', true, mode === 'permanent'))) { $('#list')?.focus(); return; }
   }
   S.deleting = true; S.del = { done: 0, total: paths.length, path: '' };
   go('results');
@@ -635,14 +614,26 @@ async function doDeleteNow() {
     const outcomeKind = (o) => (typeof o === 'string' ? o : Object.keys(o)[0]);
     const by = (k) => res.filter((r) => outcomeKind(r.outcome) === k);
     const deleted = by('deleted'), gone = by('alreadyGone'), kept = by('notEmpty'), failed = by('failed'), prot = by('protected');
-    const stopped = res.length < paths.length;
-    const rm = new Set([...deleted, ...gone].map((r) => r.path)); S.report.folders = S.report.folders.filter((f) => !rm.has(f.path)); rm.forEach((p) => S.checked.delete(p));
+    const deletedParents = new Set(deleted.map((r) => pathKey(r.path)));
+    const reported = new Set(res.map((r) => r.path));
+    const untouched = paths.filter((p) => !reported.has(p) && !hasAncestor(pathKey(p), deletedParents)).length;
+    const stopped = untouched > 0;
+    const removed = new Set([...deleted, ...gone].map((r) => r.path));
+    let inherited = 0;
+    S.report.folders = S.report.folders.filter((f) => {
+      if (!removed.has(f.path)) {
+        if (!hasAncestor(pathKey(f.path), deletedParents)) return true;
+        inherited++;
+      }
+      S.checked.delete(f.path);
+      return false;
+    });
     S.sel = new Set(); S.cursor = 0; S.anchor = 0; // the listed rows changed
-    const parts = [`${mode === 'recycle' ? 'Moved to Recycle Bin:' : 'Deleted'} ${plural(deleted.length, 'folder')}`];
+    const parts = [`${mode === 'recycle' ? 'Moved to Recycle Bin:' : 'Deleted'} ${plural(deleted.length + inherited, 'folder')}`];
     if (kept.length) parts.push(`${kept.length} no longer empty (kept)`);
     if (prot.length) parts.push(`${prot.length} in protected locations (kept)`);
     if (failed.length) parts.push(`${failed.length} couldn't be deleted`);
-    if (stopped) parts.push(`stopped with ${paths.length - res.length} untouched`);
+    if (stopped) parts.push(`stopped with ${untouched} untouched`);
     const msg = parts.join(' · ');
     const issues = [
       ...failed.map((r) => ({ path: r.path, what: 'Could not delete', why: Object.values(r.outcome)[0] })),
@@ -688,7 +679,7 @@ function viewSettings(m) {
   const c = S.cfg;
   m.append(h('div', { class: 'page' }, pageHead('Settings'), h('div', { class: 'box' },
     frow('Theme', null, dropdown([{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }], c.theme, (v) => { set('theme', v); applyTheme(); })),
-    frow('Ask before deleting', 'Shows a short summary and asks once', h('div', { style: 'display:contents' }, check('', c.confirmDelete, (v) => set('confirmDelete', v)))),
+    frow('Ask before deleting', 'Always asks when deleting a parent would also remove unchecked subfolders', h('div', { style: 'display:contents' }, check('', c.confirmDelete, (v) => set('confirmDelete', v)))),
     frow('Check everything after a scan', 'Turn off to pick folders one by one', h('div', { style: 'display:contents' }, check('', c.autoCheck, (v) => set('autoCheck', v)))),
     frow('Results window size', 'The window cannot be dragged, so choose how big the results screen is', dropdown([{ value: 'small', label: 'Small' }, { value: 'default', label: 'Default' }, { value: 'large', label: 'Large' }], c.resultsSize, (v) => set('resultsSize', v))),
     frow('Compact mode', 'Smaller window and tighter spacing', h('div', { style: 'display:contents' }, check('', c.compact, (v) => { set('compact', v); applyTheme(); render(); }))),
@@ -703,10 +694,10 @@ function viewAbout(m) {
     h('h2', { text: 'Quick start' }),
     h('ol', { class: 'box quick-start' },
       h('li', { text: 'Browse for a base folder or drop one onto the window, then choose Find.' }),
-      h('li', { text: 'Review the checked results. Use the filter or Top-most only to narrow the list.' }),
-      h('li', { text: 'Send checked folders to the Recycle Bin, or choose permanent deletion when you are sure.' })),
+      h('li', { text: 'Review the checked results. Use the filter to narrow the list.' }),
+      h('li', { text: 'Send checked folders to the Recycle Bin or choose permanent deletion. Deleting a nested parent also removes its empty subfolders, including unchecked ones.' })),
     h('h2', { text: 'Explorer and help' }),
-    h('div', { class: 'box' }, h('p', { text: 'Enable the context menu to scan from Explorer. Use the bug icon in the title bar to open a report on GitHub.' })),
+    h('div', { class: 'box' }, h('p', { text: 'Enable the context menu to scan from Explorer. Use the bug icon in the title bar to open GitHub Issues.' })),
     h('h2', { text: 'Keyboard' }),
     h('div', { class: 'box' }, h('dl', { class: 'kv' }, ...keys.flatMap(([k, v]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: v })])))));
 }

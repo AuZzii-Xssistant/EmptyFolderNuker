@@ -12,10 +12,12 @@ The app runs on Windows 10 and 11 with Microsoft Edge WebView2 Runtime. Run the 
 
 1. Browse for a base folder, paste its path, or drag a folder onto the window.
 2. Choose whether to scan subfolders and count folders containing only empty subfolders.
-3. Select **Find**, then review the checked results. Use the filter and **Top-most only** to narrow a large list.
+3. Select **Find**, then review the checked results. Use the filter to narrow a large list.
 4. Choose **Recycle Bin** or **Permanently**, then confirm. The Recycle Bin is the default.
 
 **More options** controls which folders to skip, whether known junk files count as content, and your default deletion method. The app rechecks folders before removal. It keeps folders with newly discovered content or subfolders outside the last scan. You can opt in to scanning through links, but deletion leaves linked locations alone.
+
+Deleting a **nested** parent also removes its empty subfolders, including unchecked ones. The app warns before this happens. It keeps folders containing regular files. Files matched by enabled junk rules can go with their folder.
 
 ## Explorer right-click menu
 
@@ -43,4 +45,4 @@ If Playwright is installed outside the project, set `EFN_PLAYWRIGHT` to its modu
 
 ## Report a problem or suggest an improvement
 
-Use the bug icon in the title bar or open the [GitHub issue forms](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/new/choose). For a bug, include your Windows version, the app version from About, and steps to reproduce it. Remove private paths from anything you attach.
+Use the bug icon in the title bar to open [GitHub Issues](https://github.com/AuZzii-Xssistant/EmptyFolderNuker/issues/). Choose **New issue** and select a bug report or feature request. For a bug, include your Windows version, the app version from About, and steps to reproduce it. Remove private paths from anything you attach.

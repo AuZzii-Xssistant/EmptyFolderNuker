@@ -54,7 +54,7 @@ ok(conf.visible === false && conf.shadow === false, 'native startup stays hidden
 const startupFit = (await calls('fit_window'))[0];
 ok(startupFit?.show === true && startupFit.width <= 460 && startupFit.height < 300, 'the first fit reveals the compact home window');
 await page.getByRole('button', { name: 'Report a bug' }).click();
-ok((await calls('open_bug_report')).length === 1, 'the title-bar bug button opens the report through the native bridge');
+ok((await calls('open_bug_report')).length === 1, 'the title-bar bug button opens GitHub Issues through the native bridge');
 ok(await page.locator('.home .check').count() === 2, 'home shows just the two v1.3 checkboxes by default');
 ok(await page.locator('.more').count() === 0, 'extra options hidden until asked for');
 await page.waitForTimeout(100);
@@ -200,7 +200,7 @@ await page.fill('#filter', '');
 await page.dispatchEvent('#filter', 'input');
 await page.waitForTimeout(250);
 const qb = await page.locator('.rtools .btn').allTextContents();
-ok(JSON.stringify(qb) === JSON.stringify(['All', 'None', 'Invert', 'Top-most only']), 'quick-select buttons sit next to the filter');
+ok(JSON.stringify(qb) === JSON.stringify(['All', 'None', 'Invert']), 'only All, None and Invert sit next to the filter');
 const fb = await box('#filter'), ab = await box('#btn-all');
 ok(Math.abs((fb.y + fb.height / 2) - (ab.y + ab.height / 2)) < 1.5, 'filter and quick-select buttons share one row');
 ok(await page.locator('text=⋯').count() === 0, 'the … button is gone');
@@ -273,25 +273,25 @@ await page.fill('#filter', '');
 await page.dispatchEvent('#filter', 'input');
 await page.waitForTimeout(250);
 ok((await page.textContent('#btn-all')) === 'All', 'buttons say "All" again without a filter');
-await page.click('#btn-top');
-ok((await checkedCount()) === total - 1, 'Top-most only ticks everything except folders inside another listed folder');
+await page.click('#btn-none');
 await page.click('#btn-invert');
-ok((await checkedCount()) === 1, 'Invert swaps ticked and unticked rows');
+ok((await checkedCount()) === total, 'Invert swaps ticked and unticked rows');
 await page.click('#btn-all');
 
 // Ctrl+D used to delete without a word: it must do nothing now
 const nDel0 = (await calls('delete_paths')).length;
 await page.keyboard.press('Control+d');
 ok((await page.locator('.modal').count()) === 0 && (await calls('delete_paths')).length === nDel0, 'Ctrl+D no longer deletes anything');
-// "Check everything under foo" must not tick foobar (same prefix, different folder)
+// The row menu acts on the folder itself, even when another row shares its path prefix.
 await page.fill('#filter', 'data\\foo');
 await page.dispatchEvent('#filter', 'input');
 await page.waitForTimeout(250);
 await page.click('#btn-none');
 ok((await page.locator('.item').count()) === 2, 'the filter finds foo and foobar');
 await page.locator('.item[data-i="0"]').click({ button: 'right' });
-await page.click('.menu >> text=Check everything under this folder');
-ok((await checkedCount()) === total - 1 && (await page.locator('.item[data-i="1"] .chk').getAttribute('aria-checked')) === 'false', '"Check everything under foo" ticks foo only, not foobar');
+ok(await page.getByRole('menuitem', { name: 'Check everything under this folder' }).count() === 0, 'the row menu has no recursive check action');
+await page.getByRole('menuitem', { name: 'Check', exact: false }).first().click();
+ok((await checkedCount()) === total - 1 && (await page.locator('.item[data-i="1"] .chk').getAttribute('aria-checked')) === 'false', 'checking foo leaves the separate foobar folder unticked');
 await page.locator('#filter').focus();
 await page.keyboard.press('Escape');
 await page.waitForTimeout(250);
@@ -325,7 +325,8 @@ ok(await page.locator('#open-menu:disabled').count() === 1, 'the menu button is 
 ok(await page.locator('#del-count').count() === 1, 'deleting shows a progress view like the scan');
 await shot('deleting');
 await page.waitForSelector('.rhead .title');
-ok(await page.locator('.home').count() === 0 && (await page.textContent('.rhead .title')).includes('Found 5,005'), 'folders are still listed after deleting, so you stay on the results (only what is left)');
+ok(await page.locator('.home').count() === 0 && (await page.textContent('.rhead .title')).includes('Found 5,004'), 'the deleted parent and its unchecked child disappear from the results');
+ok((await page.textContent('#statusbar')).includes('Deleted 2 folders'), 'the delete summary counts the unchecked child that went with its parent');
 ok(await page.locator('.rnote').count() === 0, 'a clean partial delete shows no problem note');
 await page.waitForTimeout(500);
 ok((await calls('fit_window')).length === nFitsDel, 'deleting does not resize the window');
@@ -608,6 +609,23 @@ await page.keyboard.press('Escape');
   const names = await p3.evaluate(() => window.__calls.map((c) => c[0]));
   ok(names.lastIndexOf('store_settings') >= 0 && names.lastIndexOf('store_settings') < names.lastIndexOf('window_close'), 'pending settings are written before the window closes');
   await p3.close();
+}
+
+// A checked parent can affect unchecked rows, even when ordinary confirmations are disabled.
+{
+  const nested = await browser.newPage();
+  await nested.addInitScript(() => { window.__seed = JSON.stringify({ base: 'C:\\Data', confirmDelete: false }); });
+  await nested.addInitScript(mock);
+  await nested.goto(base);
+  await nested.waitForSelector('.home');
+  await nested.keyboard.press('Control+Enter');
+  await nested.click('#btn-none');
+  await nested.locator('.item[data-i="0"] .chk').click();
+  await nested.click('#del-btn');
+  ok((await nested.textContent('.modal')).includes('Uncheck the parent to keep those subfolders'), 'unchecked descendants trigger a warning even when ordinary confirmations are off');
+  await nested.locator('.modal').getByRole('button', { name: 'Cancel', exact: true }).click();
+  ok(!(await nested.evaluate(() => window.__calls.some(([name]) => name === 'delete_paths'))), 'cancel keeps both the parent and its unchecked child');
+  await nested.close();
 }
 
 ok(await page.locator('select, input[type=checkbox], input[type=radio], input[type=range], input[type=file]').count() === 0, 'no native form controls');
